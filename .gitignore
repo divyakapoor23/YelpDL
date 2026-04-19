@@ -1,0 +1,15 @@
+# Data
+*.csv
+*.json
+*.parquet
+*.xlsx
+data/
+
+# Environment/System
+.DS_Store
+.ipynb_checkpoints/
+__pycache__/
+.env
+.venv/
+venv/
+.Rproj.user/

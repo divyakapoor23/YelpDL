@@ -1,5 +1,4 @@
 import os
-import json
 import random
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -37,7 +36,12 @@ torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
 print(f"Using device: {DEVICE}")
 
 # Resolve dataset paths relative to this file so runs work from any cwd.
@@ -60,24 +64,18 @@ VOCAB_SIZE = 20000
 EMBED_DIM = 128
 LSTM_HIDDEN = 128
 REGION_EMBED_DIM = 16
-BATCH_SIZE = 32
+BATCH_SIZE = 64 if DEVICE.type in ("cuda", "mps") else 32
 EPOCHS = 5
 LEARNING_RATE = 1e-4
 IMAGE_SIZE = 224
-NUM_WORKERS = 2
+NUM_WORKERS = min(os.cpu_count() or 1, 4)
 
 
 # =========================================================
 # Helpers
 # =========================================================
 def read_json_lines(path: Path, nrows: Optional[int] = None) -> pd.DataFrame:
-    rows = []
-    with open(path, "r", encoding="utf-8") as f:
-        for i, line in enumerate(f):
-            if nrows is not None and i >= nrows:
-                break
-            rows.append(json.loads(line))
-    return pd.DataFrame(rows)
+    return pd.read_json(path, lines=True, nrows=nrows)
 
 
 def save_metrics(metrics: dict, filename: str) -> None:
@@ -201,19 +199,19 @@ class YelpMultimodalDataset(Dataset):
         region_ids: np.ndarray,
         image_transform=None,
     ):
-        self.df = df.reset_index(drop=True)
+        # Pre-extract columns as plain Python lists/arrays to avoid slow df.iloc in __getitem__
+        self.image_paths = df["image_path"].tolist()
+        self.sentiments = df["sentiment"].astype(int).tolist()
         self.text_sequences = text_sequences
         self.region_ids = region_ids
         self.image_transform = image_transform
 
     def __len__(self):
-        return len(self.df)
+        return len(self.image_paths)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-
         try:
-            image = Image.open(row["image_path"]).convert("RGB")
+            image = Image.open(self.image_paths[idx]).convert("RGB")
         except (UnidentifiedImageError, OSError):
             return None
 
@@ -222,7 +220,7 @@ class YelpMultimodalDataset(Dataset):
 
         text_seq = torch.tensor(self.text_sequences[idx], dtype=torch.long)
         region_id = torch.tensor(self.region_ids[idx], dtype=torch.long)
-        label = torch.tensor(int(row["sentiment"]), dtype=torch.float32)
+        label = torch.tensor(self.sentiments[idx], dtype=torch.float32)
 
         return image, text_seq, region_id, label
 
@@ -334,10 +332,70 @@ class MultimodalFusionModel(nn.Module):
         return logits
 
 
+class ImageTextFusionModel(nn.Module):
+    """Image + Text fusion without region embedding (ablation: no geographic context)."""
+
+    def __init__(self, vocab_size: int):
+        super().__init__()
+
+        # Image branch
+        backbone = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        img_features = backbone.fc.in_features
+        backbone.fc = nn.Identity()
+        self.image_backbone = backbone
+        self.image_proj = nn.Linear(img_features, 128)
+
+        # Text branch
+        self.text_embedding = nn.Embedding(vocab_size, EMBED_DIM, padding_idx=0)
+        self.text_lstm = nn.LSTM(EMBED_DIM, LSTM_HIDDEN, batch_first=True)
+        self.text_proj = nn.Linear(LSTM_HIDDEN, 128)
+
+        # Fusion head (128 img + 128 text)
+        self.classifier = nn.Sequential(
+            nn.Linear(128 + 128, 128),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, images, text_seq):
+        img_feat = self.image_backbone(images)
+        img_feat = self.image_proj(img_feat)
+        txt_emb = self.text_embedding(text_seq)
+        _, (hidden, _) = self.text_lstm(txt_emb)
+        txt_feat = self.text_proj(hidden[-1])
+        combined = torch.cat([img_feat, txt_feat], dim=1)
+        logits = self.classifier(combined).squeeze(1)
+        return logits
+
+
 # =========================================================
 # Step 6: Training and evaluation
 # =========================================================
-def train_epoch_multimodal(model, dataloader, optimizer, criterion):
+def _forward_batch(model: nn.Module, batch: tuple, mode: str):
+    """Route a batch to the correct model signature based on ablation mode."""
+    images, text_seq, region_ids, labels = batch
+    images = images.to(DEVICE)
+    text_seq = text_seq.to(DEVICE)
+    region_ids = region_ids.to(DEVICE)
+    labels = labels.to(DEVICE)
+
+    if mode == "image":
+        logits = model(images)
+    elif mode == "text":
+        logits = model(text_seq)
+    elif mode == "image_text":
+        logits = model(images, text_seq)
+    else:  # "full"
+        logits = model(images, text_seq, region_ids)
+
+    return logits, labels
+
+
+def train_epoch(model: nn.Module, dataloader: DataLoader, optimizer, criterion, mode: str) -> dict:
     model.train()
     running_loss = 0.0
     valid_sample_count = 0
@@ -346,19 +404,11 @@ def train_epoch_multimodal(model, dataloader, optimizer, criterion):
     for batch in dataloader:
         if batch is None:
             continue
-
-        images, text_seq, region_ids, labels = batch
-        images = images.to(DEVICE)
-        text_seq = text_seq.to(DEVICE)
-        region_ids = region_ids.to(DEVICE)
-        labels = labels.to(DEVICE)
-
-        optimizer.zero_grad()
-        logits = model(images, text_seq, region_ids)
+        logits, labels = _forward_batch(model, batch, mode)
+        optimizer.zero_grad(set_to_none=True)
         loss = criterion(logits, labels)
         loss.backward()
         optimizer.step()
-
         running_loss += loss.item() * labels.size(0)
         valid_sample_count += labels.size(0)
         preds = (torch.sigmoid(logits) >= 0.5).long().cpu().numpy()
@@ -373,7 +423,13 @@ def train_epoch_multimodal(model, dataloader, optimizer, criterion):
     return metrics
 
 
-def eval_epoch_multimodal(model, dataloader, criterion):
+def eval_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion,
+    mode: str,
+    verbose: bool = False,
+) -> dict:
     model.eval()
     running_loss = 0.0
     valid_sample_count = 0
@@ -383,16 +439,8 @@ def eval_epoch_multimodal(model, dataloader, criterion):
         for batch in dataloader:
             if batch is None:
                 continue
-
-            images, text_seq, region_ids, labels = batch
-            images = images.to(DEVICE)
-            text_seq = text_seq.to(DEVICE)
-            region_ids = region_ids.to(DEVICE)
-            labels = labels.to(DEVICE)
-
-            logits = model(images, text_seq, region_ids)
+            logits, labels = _forward_batch(model, batch, mode)
             loss = criterion(logits, labels)
-
             running_loss += loss.item() * labels.size(0)
             valid_sample_count += labels.size(0)
             preds = (torch.sigmoid(logits) >= 0.5).long().cpu().numpy()
@@ -404,63 +452,71 @@ def eval_epoch_multimodal(model, dataloader, criterion):
 
     metrics = compute_metrics(all_labels, all_preds)
     metrics["loss"] = running_loss / valid_sample_count
-    print("\nClassification Report:")
-    print(classification_report(all_labels, all_preds, digits=4))
-    print("Confusion Matrix:")
-    print(confusion_matrix(all_labels, all_preds))
+    if verbose:
+        print("\nClassification Report:")
+        print(classification_report(all_labels, all_preds, digits=4, zero_division=0))
+        print("Confusion Matrix:")
+        print(confusion_matrix(all_labels, all_preds))
     return metrics
 
 
-def train_multimodal_model(train_loader, val_loader, vocab_size: int, num_regions: int):
-    model = MultimodalFusionModel(vocab_size=vocab_size, num_regions=num_regions).to(DEVICE)
-    criterion = nn.BCEWithLogitsLoss()
+def run_experiment(
+    name: str,
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    mode: str,
+    pos_weight: torch.Tensor,
+) -> dict:
+    """Train one ablation variant and return its best-epoch validation metrics."""
+    safe_name = name.replace(" ", "_").replace("+", "plus")
+    print(f"\n{'='*64}")
+    print(f"  Experiment: {name}  [mode={mode}]")
+    print(f"{'='*64}")
+
+    model = model.to(DEVICE)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    best_f1 = -1
-    best_path = OUTPUT_DIR / "best_multimodal_model.pt"
-
+    best_f1 = -1.0
+    best_metrics: dict = {}
+    best_path = OUTPUT_DIR / f"best_{safe_name}.pt"
     history = []
 
     for epoch in range(1, EPOCHS + 1):
-        train_metrics = train_epoch_multimodal(model, train_loader, optimizer, criterion)
-        val_metrics = eval_epoch_multimodal(model, val_loader, criterion)
+        is_last = epoch == EPOCHS
+        train_m = train_epoch(model, train_loader, optimizer, criterion, mode)
+        val_m = eval_epoch(model, val_loader, criterion, mode, verbose=is_last)
 
         row = {
             "epoch": epoch,
-            **{f"train_{k}": v for k, v in train_metrics.items()},
-            **{f"val_{k}": v for k, v in val_metrics.items()},
+            **{f"train_{k}": v for k, v in train_m.items()},
+            **{f"val_{k}": v for k, v in val_m.items()},
         }
         history.append(row)
 
         print(
-            f"Epoch {epoch}/{EPOCHS} | "
-            f"Train F1: {train_metrics['f1']:.4f} | "
-            f"Val F1: {val_metrics['f1']:.4f}"
+            f"  Epoch {epoch}/{EPOCHS} | "
+            f"Train F1: {train_m['f1']:.4f} | "
+            f"Val F1: {val_m['f1']:.4f} | "
+            f"Val Acc: {val_m['accuracy']:.4f}"
         )
 
-        if val_metrics["f1"] > best_f1:
-            best_f1 = val_metrics["f1"]
+        if val_m["f1"] > best_f1:
+            best_f1 = val_m["f1"]
+            best_metrics = {f"val_{k}": v for k, v in val_m.items()}
+            best_metrics["best_epoch"] = epoch
             torch.save(model.state_dict(), best_path)
-            print(f"Saved best model to {best_path}")
 
-    history_df = pd.DataFrame(history)
-    history_df.to_csv(OUTPUT_DIR / "multimodal_training_history.csv", index=False)
-    return model, history_df
-
-
-# =========================================================
-# Optional: simple ablation baseline hooks
-# =========================================================
-# In your report, compare:
-# 1. ImageOnlyModel
-# 2. TextOnlyModel
-# 3. MultimodalFusionModel without region
-# 4. MultimodalFusionModel with region
-# You can reuse the same train/eval structure with minor changes.
+    pd.DataFrame(history).to_csv(
+        OUTPUT_DIR / f"history_{safe_name}.csv", index=False
+    )
+    print(f"  Best Val F1: {best_f1:.4f} (epoch {best_metrics['best_epoch']})")
+    return best_metrics
 
 
 # =========================================================
-# Step 7: Main script
+# Step 7: Ablation Study — Main
 # =========================================================
 def main():
     business_df, review_df, photo_df = load_yelp_data(
@@ -478,10 +534,9 @@ def main():
         photo_dir=PHOTO_DIR,
     )
 
-    # Optional: downsample for faster first run
     df = df.sample(min(len(df), 30000), random_state=SEED).reset_index(drop=True)
 
-    # Split
+    # Shared train/val split — identical across all 4 experiments
     train_df, val_df = train_test_split(
         df,
         test_size=0.2,
@@ -489,16 +544,26 @@ def main():
         stratify=df["sentiment"],
     )
 
-    # Tokenizer only on train text
+    # Class-weighted loss to address positive-class imbalance
+    neg_count = int((train_df["sentiment"] == 0).sum())
+    pos_count = int((train_df["sentiment"] == 1).sum())
+    pos_weight = torch.tensor([neg_count / pos_count], dtype=torch.float32).to(DEVICE)
+    print(f"Class balance — pos: {pos_count}, neg: {neg_count}, pos_weight: {pos_weight.item():.3f}")
+
+    # Text encoding (fit on train only)
     tokenizer = fit_tokenizer(train_df["review_text"].tolist(), vocab_size=VOCAB_SIZE)
     X_train_text = encode_texts(tokenizer, train_df["review_text"].tolist(), max_len=MAX_TEXT_LEN)
     X_val_text = encode_texts(tokenizer, val_df["review_text"].tolist(), max_len=MAX_TEXT_LEN)
 
-    # Reserve one embedding slot for regions only seen in validation.
-    region_to_id = {region: index for index, region in enumerate(sorted(train_df["region"].unique()))}
+    # Region encoding with unknown-bucket for unseen val regions
+    region_to_id = {
+        region: idx for idx, region in enumerate(sorted(train_df["region"].unique()))
+    }
     unknown_region_id = len(region_to_id)
     train_region_ids = train_df["region"].map(region_to_id).to_numpy(dtype=np.int64)
-    val_region_ids = val_df["region"].map(lambda region: region_to_id.get(region, unknown_region_id)).to_numpy(dtype=np.int64)
+    val_region_ids = val_df["region"].map(
+        lambda r: region_to_id.get(r, unknown_region_id)
+    ).to_numpy(dtype=np.int64)
     num_regions = unknown_region_id + 1
     unseen_val_regions = val_df.loc[~val_df["region"].isin(region_to_id), "region"].nunique()
     print(f"Number of regions: {num_regions}")
@@ -518,35 +583,59 @@ def main():
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    # Datasets
-    train_dataset = YelpMultimodalDataset(train_df, X_train_text, train_region_ids, image_transform=train_transform)
-    val_dataset = YelpMultimodalDataset(val_df, X_val_text, val_region_ids, image_transform=val_transform)
-
+    # Shared DataLoaders (same data across all 4 experiments)
+    _pin = DEVICE.type == "cuda"
+    train_dataset = YelpMultimodalDataset(
+        train_df, X_train_text, train_region_ids, image_transform=train_transform
+    )
+    val_dataset = YelpMultimodalDataset(
+        val_df, X_val_text, val_region_ids, image_transform=val_transform
+    )
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=NUM_WORKERS,
-        collate_fn=safe_collate,
+        train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS,
+        collate_fn=safe_collate, pin_memory=_pin, persistent_workers=NUM_WORKERS > 0,
     )
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        collate_fn=safe_collate,
+        val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS,
+        collate_fn=safe_collate, pin_memory=_pin, persistent_workers=NUM_WORKERS > 0,
     )
 
-    # Train
-    model, history_df = train_multimodal_model(
-        train_loader=train_loader,
-        val_loader=val_loader,
-        vocab_size=VOCAB_SIZE,
-        num_regions=num_regions,
-    )
+    # ── Ablation experiments (same split, same pos_weight) ─────────────────
+    experiments = [
+        ("Image Only",            ImageOnlyModel(),                                    "image"),
+        ("Text Only",             TextOnlyModel(VOCAB_SIZE, EMBED_DIM, LSTM_HIDDEN),   "text"),
+        ("Image + Text",          ImageTextFusionModel(VOCAB_SIZE),                    "image_text"),
+        ("Image + Text + Region", MultimodalFusionModel(VOCAB_SIZE, num_regions),      "full"),
+    ]
 
-    print("Training complete.")
-    print(history_df.tail())
+    ablation_results: dict = {}
+    for exp_name, model, mode in experiments:
+        best = run_experiment(exp_name, model, train_loader, val_loader, mode, pos_weight)
+        ablation_results[exp_name] = best
+
+    # ── Print comparison table ─────────────────────────────────────────────
+    rows = []
+    for exp_name, m in ablation_results.items():
+        rows.append({
+            "Model":      exp_name,
+            "Best Epoch": m["best_epoch"],
+            "Accuracy":   f"{m['val_accuracy']:.4f}",
+            "Precision":  f"{m['val_precision']:.4f}",
+            "Recall":     f"{m['val_recall']:.4f}",
+            "F1":         f"{m['val_f1']:.4f}",
+            "Loss":       f"{m['val_loss']:.4f}",
+        })
+
+    table_df = pd.DataFrame(rows)
+
+    print("\n" + "=" * 72)
+    print("ABLATION STUDY — BEST VALIDATION METRICS PER MODEL VARIANT")
+    print("=" * 72)
+    print(table_df.to_string(index=False))
+    print("=" * 72)
+
+    table_df.to_csv(OUTPUT_DIR / "ablation_results.csv", index=False)
+    print(f"\nFull results saved to {OUTPUT_DIR / 'ablation_results.csv'}")
 
 
 if __name__ == "__main__":

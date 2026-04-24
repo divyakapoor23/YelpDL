@@ -6,7 +6,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
@@ -17,7 +17,6 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
 )
-from sklearn.preprocessing import LabelEncoder
 
 import torch
 import torch.nn as nn
@@ -41,14 +40,16 @@ if torch.cuda.is_available():
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
-# Update these paths to match your machine
-DATA_DIR = Path("./yelp_dataset")
-BUSINESS_PATH = DATA_DIR / "business.json"
-REVIEW_PATH = DATA_DIR / "review.json"
-PHOTO_META_PATH = DATA_DIR / "photos.json"
-PHOTO_DIR = DATA_DIR / "photos"
+# Resolve dataset paths relative to this file so runs work from any cwd.
+PROJECT_ROOT = Path(__file__).resolve().parent
+JSON_DATA_DIR = PROJECT_ROOT / "Data" / "Yelp JSON" / "yelp_dataset"
+PHOTO_DATA_DIR = PROJECT_ROOT / "Data" / "Yelp Photos" / "yelp_photos"
+BUSINESS_PATH = JSON_DATA_DIR / "yelp_academic_dataset_business.json"
+REVIEW_PATH = JSON_DATA_DIR / "yelp_academic_dataset_review.json"
+PHOTO_META_PATH = PHOTO_DATA_DIR / "photos.json"
+PHOTO_DIR = PHOTO_DATA_DIR / "photos"
 
-OUTPUT_DIR = Path("./outputs")
+OUTPUT_DIR = PROJECT_ROOT / "outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_REVIEWS = 120000          # use smaller sample first if dataset is large
@@ -211,7 +212,11 @@ class YelpMultimodalDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
 
-        image = Image.open(row["image_path"]).convert("RGB")
+        try:
+            image = Image.open(row["image_path"]).convert("RGB")
+        except (UnidentifiedImageError, OSError):
+            return None
+
         if self.image_transform:
             image = self.image_transform(image)
 
@@ -220,6 +225,20 @@ class YelpMultimodalDataset(Dataset):
         label = torch.tensor(int(row["sentiment"]), dtype=torch.float32)
 
         return image, text_seq, region_id, label
+
+
+def safe_collate(batch):
+    valid_items = [item for item in batch if item is not None]
+    if not valid_items:
+        return None
+
+    images, text_seq, region_ids, labels = zip(*valid_items)
+    return (
+        torch.stack(images),
+        torch.stack(text_seq),
+        torch.stack(region_ids),
+        torch.stack(labels),
+    )
 
 
 # =========================================================
@@ -321,9 +340,14 @@ class MultimodalFusionModel(nn.Module):
 def train_epoch_multimodal(model, dataloader, optimizer, criterion):
     model.train()
     running_loss = 0.0
+    valid_sample_count = 0
     all_preds, all_labels = [], []
 
-    for images, text_seq, region_ids, labels in dataloader:
+    for batch in dataloader:
+        if batch is None:
+            continue
+
+        images, text_seq, region_ids, labels = batch
         images = images.to(DEVICE)
         text_seq = text_seq.to(DEVICE)
         region_ids = region_ids.to(DEVICE)
@@ -336,22 +360,31 @@ def train_epoch_multimodal(model, dataloader, optimizer, criterion):
         optimizer.step()
 
         running_loss += loss.item() * labels.size(0)
+        valid_sample_count += labels.size(0)
         preds = (torch.sigmoid(logits) >= 0.5).long().cpu().numpy()
         all_preds.extend(preds.tolist())
         all_labels.extend(labels.cpu().numpy().astype(int).tolist())
 
+    if valid_sample_count == 0:
+        raise RuntimeError("No valid training samples were loaded. Check the image files.")
+
     metrics = compute_metrics(all_labels, all_preds)
-    metrics["loss"] = running_loss / len(dataloader.dataset)
+    metrics["loss"] = running_loss / valid_sample_count
     return metrics
 
 
 def eval_epoch_multimodal(model, dataloader, criterion):
     model.eval()
     running_loss = 0.0
+    valid_sample_count = 0
     all_preds, all_labels = [], []
 
     with torch.no_grad():
-        for images, text_seq, region_ids, labels in dataloader:
+        for batch in dataloader:
+            if batch is None:
+                continue
+
+            images, text_seq, region_ids, labels = batch
             images = images.to(DEVICE)
             text_seq = text_seq.to(DEVICE)
             region_ids = region_ids.to(DEVICE)
@@ -361,12 +394,16 @@ def eval_epoch_multimodal(model, dataloader, criterion):
             loss = criterion(logits, labels)
 
             running_loss += loss.item() * labels.size(0)
+            valid_sample_count += labels.size(0)
             preds = (torch.sigmoid(logits) >= 0.5).long().cpu().numpy()
             all_preds.extend(preds.tolist())
             all_labels.extend(labels.cpu().numpy().astype(int).tolist())
 
+    if valid_sample_count == 0:
+        raise RuntimeError("No valid validation samples were loaded. Check the image files.")
+
     metrics = compute_metrics(all_labels, all_preds)
-    metrics["loss"] = running_loss / len(dataloader.dataset)
+    metrics["loss"] = running_loss / valid_sample_count
     print("\nClassification Report:")
     print(classification_report(all_labels, all_preds, digits=4))
     print("Confusion Matrix:")
@@ -457,12 +494,16 @@ def main():
     X_train_text = encode_texts(tokenizer, train_df["review_text"].tolist(), max_len=MAX_TEXT_LEN)
     X_val_text = encode_texts(tokenizer, val_df["review_text"].tolist(), max_len=MAX_TEXT_LEN)
 
-    # Region encoding
-    region_encoder = LabelEncoder()
-    train_region_ids = region_encoder.fit_transform(train_df["region"])
-    val_region_ids = region_encoder.transform(val_df["region"])
-    num_regions = len(region_encoder.classes_)
+    # Reserve one embedding slot for regions only seen in validation.
+    region_to_id = {region: index for index, region in enumerate(sorted(train_df["region"].unique()))}
+    unknown_region_id = len(region_to_id)
+    train_region_ids = train_df["region"].map(region_to_id).to_numpy(dtype=np.int64)
+    val_region_ids = val_df["region"].map(lambda region: region_to_id.get(region, unknown_region_id)).to_numpy(dtype=np.int64)
+    num_regions = unknown_region_id + 1
+    unseen_val_regions = val_df.loc[~val_df["region"].isin(region_to_id), "region"].nunique()
     print(f"Number of regions: {num_regions}")
+    if unseen_val_regions:
+        print(f"Validation regions unseen in train: {unseen_val_regions}")
 
     # Image transforms
     train_transform = transforms.Compose([
@@ -481,8 +522,20 @@ def main():
     train_dataset = YelpMultimodalDataset(train_df, X_train_text, train_region_ids, image_transform=train_transform)
     val_dataset = YelpMultimodalDataset(val_df, X_val_text, val_region_ids, image_transform=val_transform)
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        collate_fn=safe_collate,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        collate_fn=safe_collate,
+    )
 
     # Train
     model, history_df = train_multimodal_model(

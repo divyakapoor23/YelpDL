@@ -1,0 +1,19 @@
+name: YelpDL
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    - ipykernel
+    - streamlit
+    - seaborn
+    - pandas
+    - torch
+    - torchvision
+    - keras
+    - tensorflow
+    - numpy
+    - plotly
+    - spacy
+    - scikit-learn
+    - corextopic
+    - vaderSentiment

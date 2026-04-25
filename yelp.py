@@ -116,6 +116,19 @@ def scale_rating(rating: float) -> float:
     return float((rating - 1.0) / 4.0)
 
 
+def estimate_image_quality(image_path: str) -> Optional[float]:
+    """Cheap image-quality proxy using grayscale edge energy."""
+    try:
+        image = Image.open(image_path).convert("L").resize((128, 128))
+    except (UnidentifiedImageError, OSError):
+        return None
+
+    gray = np.asarray(image, dtype=np.float32) / 255.0
+    dx = np.abs(np.diff(gray, axis=1)).mean()
+    dy = np.abs(np.diff(gray, axis=0)).mean()
+    return float(dx + dy)
+
+
 # =========================================================
 # Step 1: Load Yelp data
 # =========================================================
@@ -900,108 +913,196 @@ def cross_modal_retrieval_analysis(
     print(f"Saved image->text results to {OUTPUT_DIR / 'retrieval_image_to_text.csv'}")
     print("=" * 72)
 
-    image_model = ImageOnlyModel().to(DEVICE)
-    text_model = TextOnlyModel(vocab_size, EMBED_DIM, LSTM_HIDDEN).to(DEVICE)
-    image_model.load_state_dict(torch.load(image_ckpt, map_location=DEVICE))
-    text_model.load_state_dict(torch.load(text_ckpt, map_location=DEVICE))
-    image_model.eval()
-    text_model.eval()
 
-    rows = []
+def _evaluate_subset_predictions(subset_df: pd.DataFrame, pred_col: str = "pred") -> dict:
+    subset_df = subset_df.dropna(subset=[pred_col]).copy()
+    if subset_df.empty:
+        return {"samples": 0, "accuracy": np.nan, "precision": np.nan, "recall": np.nan, "f1": np.nan}
+
+    metrics = compute_metrics(
+        subset_df["sentiment"].astype(int).tolist(),
+        subset_df[pred_col].astype(int).tolist(),
+    )
+    metrics["samples"] = int(len(subset_df))
+    return metrics
+
+
+def _predict_text_model(model: nn.Module, subset_df: pd.DataFrame, tokenizer: Tokenizer) -> List[int]:
+    preds = []
+    model.eval()
     with torch.no_grad():
-        for batch in val_loader:
-            if batch is None:
+        for text in subset_df["review_text"].astype(str).tolist():
+            seq = encode_texts(tokenizer, [text], max_len=MAX_TEXT_LEN)
+            tensor = torch.tensor(seq, dtype=torch.long, device=DEVICE)
+            logits = model(tensor)
+            preds.append(int((torch.sigmoid(logits) >= 0.5).item()))
+    return preds
+
+
+def _predict_full_model(
+    model: nn.Module,
+    subset_df: pd.DataFrame,
+    tokenizer: Tokenizer,
+    region_to_id: dict,
+    unknown_region_id: int,
+    image_transform,
+) -> List[int]:
+    preds = []
+    model.eval()
+    with torch.no_grad():
+        for _, row in subset_df.iterrows():
+            try:
+                image = Image.open(row["image_path"]).convert("RGB")
+            except (UnidentifiedImageError, OSError):
+                preds.append(np.nan)
                 continue
 
-            images, text_seq, region_ids, _category_ids, _ratings, labels = batch
-            images = images.to(DEVICE)
-            text_seq = text_seq.to(DEVICE)
-            labels = labels.to(DEVICE)
+            image_tensor = image_transform(image).unsqueeze(0).to(DEVICE)
+            seq = encode_texts(tokenizer, [str(row["review_text"])], max_len=MAX_TEXT_LEN)
+            text_tensor = torch.tensor(seq, dtype=torch.long, device=DEVICE)
+            region_id = torch.tensor(
+                [region_to_id.get(row["region"], unknown_region_id)],
+                dtype=torch.long,
+                device=DEVICE,
+            )
+            sent_logits, _cat_logits, _rating_pred = model(image_tensor, text_tensor, region_id)
+            preds.append(int((torch.sigmoid(sent_logits) >= 0.5).item()))
+    return preds
 
-            image_probs = torch.sigmoid(image_model(images))
-            text_probs = torch.sigmoid(text_model(text_seq))
 
-            image_preds = (image_probs >= 0.5).long()
-            text_preds = (text_probs >= 0.5).long()
+def _predict_image_model(model: nn.Module, subset_df: pd.DataFrame, image_transform) -> List[int]:
+    preds = []
+    model.eval()
+    with torch.no_grad():
+        for image_path in subset_df["image_path"].astype(str).tolist():
+            try:
+                image = Image.open(image_path).convert("RGB")
+            except (UnidentifiedImageError, OSError):
+                preds.append(np.nan)
+                continue
+            image_tensor = image_transform(image).unsqueeze(0).to(DEVICE)
+            logits = model(image_tensor)
+            preds.append(int((torch.sigmoid(logits) >= 0.5).item()))
+    return preds
 
-            for i in range(labels.size(0)):
-                region_id = int(region_ids[i].item())
-                rows.append(
-                    {
-                        "label": int(labels[i].item()),
-                        "region_id": region_id,
-                        "region": id_to_region.get(region_id, "<unknown_region>"),
-                        "image_prob": float(image_probs[i].item()),
-                        "text_prob": float(text_probs[i].item()),
-                        "image_pred": int(image_preds[i].item()),
-                        "text_pred": int(text_preds[i].item()),
-                    }
-                )
 
-    if not rows:
-        print("No valid validation samples available for consistency analysis.")
+def data_quality_noise_analysis(
+    val_df: pd.DataFrame,
+    tokenizer: Tokenizer,
+    val_transform,
+    region_to_id: dict,
+    unknown_region_id: int,
+    num_regions: int,
+    num_categories: int,
+) -> None:
+    """
+    Analyze likely dataset noise across three axes:
+    1. Short vs long reviews
+    2. With vs without captions
+    3. Image quality impact
+    """
+    print("\n" + "=" * 72)
+    print("DATA QUALITY & NOISE ANALYSIS")
+    print("=" * 72)
+
+    text_ckpt = OUTPUT_DIR / "best_Text_Only.pt"
+    full_ckpt = OUTPUT_DIR / "best_Image_plus_Text_plus_Region.pt"
+    image_ckpt = OUTPUT_DIR / "best_Image_Only.pt"
+
+    if not text_ckpt.exists() or not full_ckpt.exists() or not image_ckpt.exists():
+        print("Skipping data quality analysis: one or more checkpoints are missing.")
+        print(f"Expected: {text_ckpt}, {full_ckpt}, {image_ckpt}")
         print("=" * 72)
         return
 
-    pred_df = pd.DataFrame(rows)
-    pred_df["mismatch"] = pred_df["image_pred"] != pred_df["text_pred"]
-    pred_df["img_pos_txt_neg"] = (pred_df["image_pred"] == 1) & (pred_df["text_pred"] == 0)
-    pred_df["img_neg_txt_pos"] = (pred_df["image_pred"] == 0) & (pred_df["text_pred"] == 1)
+    text_model = TextOnlyModel(VOCAB_SIZE, EMBED_DIM, LSTM_HIDDEN).to(DEVICE)
+    text_model.load_state_dict(torch.load(text_ckpt, map_location=DEVICE))
 
-    total = len(pred_df)
-    mismatch_count = int(pred_df["mismatch"].sum())
-    mismatch_rate = mismatch_count / total
-    img_pos_txt_neg_count = int(pred_df["img_pos_txt_neg"].sum())
-    img_neg_txt_pos_count = int(pred_df["img_neg_txt_pos"].sum())
+    full_model = MultimodalFusionModel(VOCAB_SIZE, num_regions, num_categories).to(DEVICE)
+    full_model.load_state_dict(torch.load(full_ckpt, map_location=DEVICE))
 
-    print(f"Total validation samples compared: {total}")
-    print(f"Mismatch count (image_pred != text_pred): {mismatch_count}")
-    print(f"Mismatch rate: {mismatch_rate:.4f}")
-    print(f"Image positive, Text negative: {img_pos_txt_neg_count}")
-    print(f"Image negative, Text positive: {img_neg_txt_pos_count}")
+    image_model = ImageOnlyModel().to(DEVICE)
+    image_model.load_state_dict(torch.load(image_ckpt, map_location=DEVICE))
 
-    mismatch_by_label = (
-        pred_df.groupby("label")["mismatch"]
-        .mean()
-        .rename(index={0: "true_negative", 1: "true_positive"})
-        .to_dict()
+    summary_rows = []
+
+    # 1. Short vs long reviews performance
+    review_len_df = val_df[["review_text", "sentiment"]].copy()
+    review_len_df["word_count"] = review_len_df["review_text"].astype(str).str.split().str.len()
+    median_words = int(review_len_df["word_count"].median())
+    short_mask = review_len_df["word_count"] <= median_words
+    long_mask = review_len_df["word_count"] > median_words
+
+    short_df = val_df.loc[short_mask].copy().reset_index(drop=True)
+    long_df = val_df.loc[long_mask].copy().reset_index(drop=True)
+    short_df["pred"] = _predict_text_model(text_model, short_df, tokenizer)
+    long_df["pred"] = _predict_text_model(text_model, long_df, tokenizer)
+
+    short_metrics = _evaluate_subset_predictions(short_df)
+    long_metrics = _evaluate_subset_predictions(long_df)
+    print(f"\n[1] Short vs Long Reviews (Text-only model)")
+    print(f"    Median review length: {median_words} words")
+    print(f"    Short reviews  -> samples={short_metrics['samples']}, F1={short_metrics['f1']:.4f}, Acc={short_metrics['accuracy']:.4f}")
+    print(f"    Long reviews   -> samples={long_metrics['samples']}, F1={long_metrics['f1']:.4f}, Acc={long_metrics['accuracy']:.4f}")
+    summary_rows.extend([
+        {"analysis": "review_length", "group": "short", **short_metrics},
+        {"analysis": "review_length", "group": "long", **long_metrics},
+    ])
+
+    # 2. With vs without captions
+    caption_mask = val_df["caption"].fillna("").astype(str).str.strip().str.len() > 0
+    with_caption_df = val_df.loc[caption_mask].copy().reset_index(drop=True)
+    without_caption_df = val_df.loc[~caption_mask].copy().reset_index(drop=True)
+    with_caption_df["pred"] = _predict_full_model(
+        full_model, with_caption_df, tokenizer, region_to_id, unknown_region_id, val_transform
     )
-    print("Mismatch rate by true label:")
-    for label_name, rate in mismatch_by_label.items():
-        print(f"  {label_name}: {rate:.4f}")
-
-    region_mismatch = (
-        pred_df.groupby("region")
-        .agg(samples=("mismatch", "count"), mismatch_rate=("mismatch", "mean"))
-        .query("samples >= 20")
-        .sort_values("mismatch_rate", ascending=False)
+    without_caption_df["pred"] = _predict_full_model(
+        full_model, without_caption_df, tokenizer, region_to_id, unknown_region_id, val_transform
     )
-    if not region_mismatch.empty:
-        print("\nTop regions with highest image-text disagreement (>=20 samples):")
-        print(region_mismatch.head(10).to_string())
+
+    with_caption_metrics = _evaluate_subset_predictions(with_caption_df)
+    without_caption_metrics = _evaluate_subset_predictions(without_caption_df)
+    print(f"\n[2] Caption Availability (Full multimodal model)")
+    print(f"    With captions    -> samples={with_caption_metrics['samples']}, F1={with_caption_metrics['f1']:.4f}, Acc={with_caption_metrics['accuracy']:.4f}")
+    print(f"    Without captions -> samples={without_caption_metrics['samples']}, F1={without_caption_metrics['f1']:.4f}, Acc={without_caption_metrics['accuracy']:.4f}")
+    summary_rows.extend([
+        {"analysis": "caption_availability", "group": "with_caption", **with_caption_metrics},
+        {"analysis": "caption_availability", "group": "without_caption", **without_caption_metrics},
+    ])
+
+    # 3. Image quality impact
+    quality_df = val_df.copy()
+    quality_df["image_quality"] = quality_df["image_path"].apply(estimate_image_quality)
+    quality_df = quality_df.dropna(subset=["image_quality"]).reset_index(drop=True)
+    if not quality_df.empty:
+        threshold = float(quality_df["image_quality"].median())
+        low_quality_df = quality_df.loc[quality_df["image_quality"] <= threshold].copy().reset_index(drop=True)
+        high_quality_df = quality_df.loc[quality_df["image_quality"] > threshold].copy().reset_index(drop=True)
+        low_quality_df["pred"] = _predict_image_model(image_model, low_quality_df, val_transform)
+        high_quality_df["pred"] = _predict_image_model(image_model, high_quality_df, val_transform)
+
+        low_quality_metrics = _evaluate_subset_predictions(low_quality_df)
+        high_quality_metrics = _evaluate_subset_predictions(high_quality_df)
+        print(f"\n[3] Image Quality Impact (Image-only model)")
+        print(f"    Quality threshold (median edge energy): {threshold:.4f}")
+        print(f"    Low-quality images  -> samples={low_quality_metrics['samples']}, F1={low_quality_metrics['f1']:.4f}, Acc={low_quality_metrics['accuracy']:.4f}")
+        print(f"    High-quality images -> samples={high_quality_metrics['samples']}, F1={high_quality_metrics['f1']:.4f}, Acc={high_quality_metrics['accuracy']:.4f}")
+        summary_rows.extend([
+            {"analysis": "image_quality", "group": "low_quality", **low_quality_metrics},
+            {"analysis": "image_quality", "group": "high_quality", **high_quality_metrics},
+        ])
 
     print(
         "\nInsight:\n"
-        "  High image-text disagreement suggests noisy multimodal pairs and\n"
-        "  subjective perception differences (e.g., image looks appealing while\n"
-        "  review text is negative, or vice versa)."
+        "  Performance gaps across these subgroups indicate real dataset noise:\n"
+        "  shorter reviews can be less informative, missing captions reduce metadata quality,\n"
+        "  and weaker image quality can damage visual prediction reliability."
     )
 
-    all_path = OUTPUT_DIR / "image_text_consistency_predictions.csv"
-    mismatch_path = OUTPUT_DIR / "image_text_consistency_mismatches.csv"
-    region_path = OUTPUT_DIR / "image_text_consistency_region_summary.csv"
-
-    pred_df.to_csv(all_path, index=False)
-    pred_df[pred_df["mismatch"]].to_csv(mismatch_path, index=False)
-    if not region_mismatch.empty:
-        region_mismatch.reset_index().to_csv(region_path, index=False)
-
-    print(f"Saved all consistency predictions to {all_path}")
-    print(f"Saved mismatch-only samples to {mismatch_path}")
-    if region_mismatch.empty:
-        print("Region summary not saved (insufficient per-region sample counts).")
-    else:
-        print(f"Saved region mismatch summary to {region_path}")
+    summary_df = pd.DataFrame(summary_rows)
+    out_path = OUTPUT_DIR / "data_quality_noise_analysis.csv"
+    summary_df.to_csv(out_path, index=False)
+    print(f"Saved subgroup analysis to {out_path}")
     print("=" * 72)
 
 
@@ -1183,6 +1284,17 @@ def main():
         max_pool_size=2000,
         top_k=5,
         query_text="spicy ramen",
+    )
+
+    # ── Data quality and noise analysis ───────────────────────────────────
+    data_quality_noise_analysis(
+        val_df=val_df,
+        tokenizer=tokenizer,
+        val_transform=val_transform,
+        region_to_id=region_to_id,
+        unknown_region_id=unknown_region_id,
+        num_regions=num_regions,
+        num_categories=num_categories,
     )
 
     # ── Text Importance Analysis (TF-IDF) ────────────────────────────────

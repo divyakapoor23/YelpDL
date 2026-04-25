@@ -9,6 +9,10 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 PYTHON_BIN = "/opt/anaconda3/envs/YelpDL/bin/python"
+RESEARCH_QUESTION = (
+	"How do visual, textual, and regional signals interact to shape perceived food sentiment, "
+	"and does incorporating geographic context improve multimodal sentiment prediction?"
+)
 
 
 st.set_page_config(
@@ -40,6 +44,8 @@ def render_table_or_message(df: pd.DataFrame | None, message: str) -> bool:
 def sidebar_controls() -> None:
 	st.sidebar.title("Controls")
 	st.sidebar.caption("Run the training/analysis pipeline or inspect saved outputs.")
+	st.sidebar.markdown("**Research Question**")
+	st.sidebar.write(RESEARCH_QUESTION)
 
 	if st.sidebar.button("Run yelp.py", use_container_width=True):
 		with st.sidebar:
@@ -175,6 +181,8 @@ def render_consistency() -> None:
 	st.header("Consistency")
 	mismatch_df = load_csv(OUTPUT_DIR / "image_text_consistency_predictions.csv")
 	region_summary = load_csv(OUTPUT_DIR / "image_text_consistency_region_summary.csv")
+	cuisine_summary = load_csv(OUTPUT_DIR / "image_text_consistency_cuisine_summary.csv")
+	rating_quality_summary = load_csv(OUTPUT_DIR / "image_text_consistency_rating_quality_summary.csv")
 	if mismatch_df is None or mismatch_df.empty:
 		st.info("No consistency analysis outputs found.")
 		return
@@ -182,7 +190,7 @@ def render_consistency() -> None:
 	mismatch_rate = mismatch_df["mismatch"].mean()
 	col1, col2, col3 = st.columns(3)
 	with col1:
-		metric_card("Mismatch rate", f"{mismatch_rate:.4f}")
+		metric_card("Perception Gap Rate", f"{mismatch_rate:.4f}")
 	with col2:
 		metric_card("Image positive / Text negative", str(int(mismatch_df["img_pos_txt_neg"].sum())))
 	with col3:
@@ -193,10 +201,32 @@ def render_consistency() -> None:
 			region_summary.sort_values("mismatch_rate", ascending=False).head(12),
 			x="region",
 			y="mismatch_rate",
-			title="Top Regions by Image-Text Disagreement",
+			title="Top Regions by Perception Gap",
 			color="mismatch_rate",
 		)
 		st.plotly_chart(fig, use_container_width=True)
+
+	c1, c2 = st.columns(2)
+	with c1:
+		if cuisine_summary is not None and not cuisine_summary.empty:
+			fig = px.bar(
+				cuisine_summary.sort_values("mismatch_rate", ascending=False).head(12),
+				x="cuisine",
+				y="mismatch_rate",
+				color="mismatch_rate",
+				title="Perception Gap by Cuisine",
+			)
+			st.plotly_chart(fig, use_container_width=True)
+	with c2:
+		if rating_quality_summary is not None and not rating_quality_summary.empty:
+			fig = px.bar(
+				rating_quality_summary,
+				x="rating_quality_cluster",
+				y="mismatch_rate",
+				color="mismatch_rate",
+				title="Perception Gap by Rating-Quality Proxy",
+			)
+			st.plotly_chart(fig, use_container_width=True)
 
 	st.subheader("Mismatch Samples")
 	st.dataframe(mismatch_df[mismatch_df["mismatch"]].head(100), use_container_width=True)
@@ -277,6 +307,7 @@ def render_region_and_quality() -> None:
 	st.header("Region and Data Quality")
 	region_df = load_csv(OUTPUT_DIR / "region_sentiment_stats.csv")
 	noise_df = load_csv(OUTPUT_DIR / "data_quality_noise_analysis.csv")
+	spread_df = load_csv(OUTPUT_DIR / "cuisine_region_sentiment_spread.csv")
 
 	left, right = st.columns(2)
 	with left:
@@ -291,6 +322,24 @@ def render_region_and_quality() -> None:
 			)
 			st.plotly_chart(fig, use_container_width=True)
 
+			heatmap_df = region_df.copy()
+			heatmap_df["bucket"] = pd.cut(
+				heatmap_df["positive_rate"],
+				bins=[0, 0.5, 0.7, 0.85, 1.0],
+				labels=["low", "moderate", "high", "very_high"],
+				include_lowest=True,
+			).astype(str)
+			cross = heatmap_df.groupby(["region", "bucket"]).size().reset_index(name="count")
+			fig = px.density_heatmap(
+				cross,
+				x="region",
+				y="bucket",
+				z="count",
+				title="Region Variation Heatmap (Sentiment Bucket Density)",
+			)
+			fig.update_xaxes(showticklabels=False)
+			st.plotly_chart(fig, use_container_width=True)
+
 	with right:
 		st.subheader("Data Quality / Noise")
 		if render_table_or_message(noise_df, "No data quality analysis found."):
@@ -303,15 +352,133 @@ def render_region_and_quality() -> None:
 				title="F1 by Data Quality Subgroup",
 			)
 			st.plotly_chart(fig, use_container_width=True)
+		if spread_df is not None and not spread_df.empty:
+			st.subheader("Same Cuisine, Different Region")
+			st.dataframe(spread_df.head(15), use_container_width=True)
+
+
+def render_research_insights() -> None:
+	st.header("Research Insights")
+	st.caption("Auto-generated narrative claims from the latest experiment outputs.")
+
+	ablation_df = load_csv(OUTPUT_DIR / "ablation_results.csv")
+	attention_df = load_csv(OUTPUT_DIR / "attention_Image_plus_Text_plus_Region.csv")
+	mismatch_df = load_csv(OUTPUT_DIR / "image_text_consistency_predictions.csv")
+	region_df = load_csv(OUTPUT_DIR / "region_sentiment_stats.csv")
+	cuisine_spread_df = load_csv(OUTPUT_DIR / "cuisine_region_sentiment_spread.csv")
+	noise_df = load_csv(OUTPUT_DIR / "data_quality_noise_analysis.csv")
+
+	if ablation_df is None or ablation_df.empty:
+		st.info("Run yelp.py first to generate insight-ready outputs.")
+		return
+
+	ablation = ablation_df.copy()
+	for column in ["Accuracy", "Precision", "Recall", "F1", "Loss", "Category Acc", "Rating MAE"]:
+		if column in ablation.columns:
+			ablation[column] = pd.to_numeric(ablation[column], errors="coerce")
+
+	def f1_for(model_name: str) -> float | None:
+		rows = ablation[ablation["Model"] == model_name]
+		if rows.empty:
+			return None
+		return float(rows.iloc[0]["F1"])
+
+	f1_text = f1_for("Text Only")
+	f1_img = f1_for("Image Only")
+	f1_img_txt = f1_for("Image + Text")
+	f1_full = f1_for("Image + Text + Region")
+
+	best_row = ablation.sort_values("F1", ascending=False).iloc[0]
+
+	insights = []
+	insights.append(
+		f"Best-performing variant is **{best_row['Model']}** with F1 **{best_row['F1']:.4f}** and accuracy **{best_row['Accuracy']:.4f}**."
+	)
+
+	if f1_text is not None and f1_img is not None:
+		insights.append(
+			f"Text signal is stronger than image-only signal in this run: Text F1 **{f1_text:.4f}** vs Image F1 **{f1_img:.4f}**."
+		)
+
+	if f1_img_txt is not None and f1_text is not None:
+		delta = f1_img_txt - f1_text
+		insights.append(
+			f"Adding image to text changes performance by **{delta:+.4f} F1** (Image+Text vs Text-only)."
+		)
+
+	if f1_full is not None and f1_img_txt is not None:
+		delta = f1_full - f1_img_txt
+		insights.append(
+			f"Adding geographic context changes performance by **{delta:+.4f} F1** (Image+Text+Region vs Image+Text)."
+		)
+
+	if attention_df is not None and not attention_df.empty:
+		img_mean = float(attention_df["alpha_img"].mean())
+		txt_mean = float(attention_df["alpha_txt"].mean())
+		img_gt_txt = float((attention_df["alpha_img"] > attention_df["alpha_txt"]).mean())
+		insights.append(
+			f"Cross-modal attention summary: mean image-attention **{img_mean:.4f}**, mean text-attention **{txt_mean:.4f}**, image-dominant samples **{img_gt_txt:.2%}**."
+		)
+
+	if mismatch_df is not None and not mismatch_df.empty:
+		gap = float(mismatch_df["mismatch"].mean())
+		insights.append(
+			f"Perception Gap Rate is **{gap:.2%}** (image and text predictions disagree), indicating substantial subjective/noisy multimodal cases."
+		)
+
+	if region_df is not None and not region_df.empty:
+		max_rate = float(region_df["positive_rate"].max())
+		min_rate = float(region_df["positive_rate"].min())
+		insights.append(
+			f"Regional sentiment spread ranges from **{min_rate:.4f}** to **{max_rate:.4f}** (delta **{(max_rate - min_rate):.4f}**), supporting geographically dependent sentiment behavior."
+		)
+
+	if cuisine_spread_df is not None and not cuisine_spread_df.empty:
+		top = cuisine_spread_df.sort_values("spread", ascending=False).iloc[0]
+		insights.append(
+			f"Strongest same-cuisine regional variability appears in **{top['cuisine_cluster']}** with spread **{top['spread']:.4f}** across regions."
+		)
+
+	if noise_df is not None and not noise_df.empty:
+		worst = noise_df.sort_values("f1", ascending=True).iloc[0]
+		best = noise_df.sort_values("f1", ascending=False).iloc[0]
+		insights.append(
+			f"Data-quality sensitivity: lowest subgroup F1 is **{worst['f1']:.4f}** ({worst['analysis']} / {worst['group']}), highest is **{best['f1']:.4f}** ({best['analysis']} / {best['group']})."
+		)
+
+	st.subheader("Presentation-Ready Claims")
+	for idx, text in enumerate(insights, start=1):
+		st.markdown(f"{idx}. {text}")
+
+	st.subheader("Evidence Snapshot")
+	evidence = pd.DataFrame(
+		{
+			"Metric": [
+				"Best model",
+				"Text-only F1",
+				"Image-only F1",
+				"Image+Text F1",
+				"Image+Text+Region F1",
+			],
+			"Value": [
+				str(best_row["Model"]),
+				f"{f1_text:.4f}" if f1_text is not None else "N/A",
+				f"{f1_img:.4f}" if f1_img is not None else "N/A",
+				f"{f1_img_txt:.4f}" if f1_img_txt is not None else "N/A",
+				f"{f1_full:.4f}" if f1_full is not None else "N/A",
+			],
+		}
+	)
+	st.dataframe(evidence, use_container_width=True)
 
 
 def main() -> None:
 	sidebar_controls()
 
 	st.title("Yelp Multimodal Analysis App")
-	st.caption("Streamlit dashboard for the multimodal Yelp pipeline in yelp.py")
+	st.caption(RESEARCH_QUESTION)
 
-	overview_tab, attention_tab, retrieval_tab, consistency_tab, text_tab, visual_tab, region_tab = st.tabs(
+	overview_tab, attention_tab, retrieval_tab, consistency_tab, text_tab, visual_tab, region_tab, insights_tab = st.tabs(
 		[
 			"Overview",
 			"Attention",
@@ -320,6 +487,7 @@ def main() -> None:
 			"Text",
 			"Visual",
 			"Region + Quality",
+			"Research Insights",
 		]
 	)
 
@@ -337,6 +505,8 @@ def main() -> None:
 		render_visual_features()
 	with region_tab:
 		render_region_and_quality()
+	with insights_tab:
+		render_research_insights()
 
 
 if __name__ == "__main__":

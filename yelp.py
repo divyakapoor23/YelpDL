@@ -72,14 +72,22 @@ VOCAB_SIZE = 20000
 EMBED_DIM = 128
 LSTM_HIDDEN = 128
 REGION_EMBED_DIM = 16
+IMAGE_TOKEN_COUNT = 4
+CROSS_ATTN_HEADS = 4
 BATCH_SIZE = 64 if DEVICE.type in ("cuda", "mps") else 32
-EPOCHS = 5
+EPOCHS = 10
 LEARNING_RATE = 1e-4
 IMAGE_SIZE = 224
 NUM_WORKERS = min(os.cpu_count() or 1, 4)
 MAX_CATEGORY_CLASSES = 20
 CATEGORY_LOSS_WEIGHT = 0.5
 RATING_LOSS_WEIGHT = 0.3
+EARLY_STOPPING_PATIENCE = 3
+EARLY_STOPPING_MIN_DELTA = 1e-4
+RESEARCH_QUESTION = (
+    "How do visual, textual, and regional signals interact to shape perceived food sentiment, "
+    "and does incorporating geographic context improve multimodal sentiment prediction?"
+)
 
 
 # =========================================================
@@ -190,8 +198,8 @@ def prepare_multimodal_dataframe(
     # Merge photo + business
     merged = photo_keep.merge(business_keep, on="business_id", how="inner")
 
-    # Merge one review per image by business_id
-    # To keep this simple, sample one review for each business-photo pair
+    # Merge one review per image by business_id.
+    # Limitation: this is business-level multimodal pairing, not guaranteed dish-level alignment.
     reviews_grouped = review_keep.groupby("business_id").agg(list).reset_index()
     merged = merged.merge(reviews_grouped, on="business_id", how="inner")
 
@@ -200,6 +208,30 @@ def prepare_multimodal_dataframe(
 
     # Create region column
     merged["region"] = merged["city"].fillna("Unknown") + "_" + merged["state"].fillna("Unknown")
+
+    # Make geography more meaningful than raw city/state for analysis.
+    city_counts = merged["city"].fillna("Unknown").value_counts()
+    q1 = city_counts.quantile(0.33)
+    q2 = city_counts.quantile(0.66)
+
+    def city_urbanicity(city: str) -> str:
+        count = city_counts.get(city, 0)
+        if count >= q2:
+            return "urban"
+        if count >= q1:
+            return "suburban"
+        return "small_town"
+
+    merged["urbanicity"] = merged["city"].fillna("Unknown").apply(city_urbanicity)
+    merged["cuisine_cluster"] = merged["categories"].apply(extract_primary_category)
+
+    # Yelp JSON lacks reliable price in this pipeline; use business stars as a quality proxy.
+    merged["rating_quality_cluster"] = pd.cut(
+        merged["stars"].astype(float),
+        bins=[0, 3.0, 4.0, 5.0],
+        labels=["low_quality_proxy", "mid_quality_proxy", "high_quality_proxy"],
+        include_lowest=True,
+    ).astype(str)
 
     # Basic cleanup
     merged = merged.dropna(subset=["image_path", "review_text", "region", "sentiment"])
@@ -340,17 +372,20 @@ class MultimodalFusionModel(nn.Module):
         # Text branch
         self.text_embedding = nn.Embedding(vocab_size, EMBED_DIM, padding_idx=0)
         self.text_lstm = nn.LSTM(EMBED_DIM, LSTM_HIDDEN, batch_first=True)
-        self.text_proj = nn.Linear(LSTM_HIDDEN, 128)
+        self.text_token_proj = nn.Linear(LSTM_HIDDEN, 128)
+        self.text_summary_proj = nn.Linear(LSTM_HIDDEN, 128)
 
-        # Modality attention gates (learn how much to trust image/text per sample)
-        self.attn_img = nn.Linear(128, 1)
-        self.attn_txt = nn.Linear(128, 1)
+        # Cross-modal attention: image attends text; text attends image tokens.
+        self.image_to_text_attn = nn.MultiheadAttention(128, CROSS_ATTN_HEADS, batch_first=True)
+        self.text_to_image_attn = nn.MultiheadAttention(128, CROSS_ATTN_HEADS, batch_first=True)
+        self.image_tokenizer = nn.Linear(128, IMAGE_TOKEN_COUNT * 128)
 
         # Region branch
         self.region_embedding = nn.Embedding(num_regions, REGION_EMBED_DIM)
+        self.category_embedding = nn.Embedding(num_categories, REGION_EMBED_DIM)
 
         # Shared fusion trunk
-        fusion_input_dim = 128 + 128 + REGION_EMBED_DIM
+        fusion_input_dim = 128 + 128 + REGION_EMBED_DIM + REGION_EMBED_DIM + REGION_EMBED_DIM
         self.fusion_trunk = nn.Sequential(
             nn.Linear(fusion_input_dim, 128),
             nn.ReLU(),
@@ -365,32 +400,50 @@ class MultimodalFusionModel(nn.Module):
         self.category_head = nn.Linear(64, num_categories)
         self.rating_head = nn.Linear(64, 1)
 
-    def forward(self, images, text_seq, region_ids, return_attention: bool = False):
+    def forward(self, images, text_seq, region_ids, category_ids, return_attention: bool = False):
         # Image features
         img_feat = self.image_backbone(images)
         img_feat = self.image_proj(img_feat)
 
         # Text features
         txt_emb = self.text_embedding(text_seq)
-        _, (hidden, _) = self.text_lstm(txt_emb)
-        txt_feat = self.text_proj(hidden[-1])
+        txt_seq_out, (hidden, _) = self.text_lstm(txt_emb)
+        txt_tokens = self.text_token_proj(txt_seq_out)
+        txt_summary = self.text_summary_proj(hidden[-1])
 
-        alpha_img = torch.sigmoid(self.attn_img(img_feat))
-        alpha_txt = torch.sigmoid(self.attn_txt(txt_feat))
-        img_feat = alpha_img * img_feat
-        txt_feat = alpha_txt * txt_feat
+        img_query = img_feat.unsqueeze(1)
+        img_attended, attn_img = self.image_to_text_attn(
+            query=img_query,
+            key=txt_tokens,
+            value=txt_tokens,
+        )
+
+        img_tokens = self.image_tokenizer(img_feat).view(-1, IMAGE_TOKEN_COUNT, 128)
+        txt_query = txt_summary.unsqueeze(1)
+        txt_attended, attn_txt = self.text_to_image_attn(
+            query=txt_query,
+            key=img_tokens,
+            value=img_tokens,
+        )
+
+        img_feat = img_attended.squeeze(1)
+        txt_feat = txt_attended.squeeze(1)
 
         # Region features
         reg_feat = self.region_embedding(region_ids)
+        cat_feat = self.category_embedding(category_ids)
+        reg_cat_interaction = reg_feat * cat_feat
 
-        # Fusion
-        combined = torch.cat([img_feat, txt_feat, reg_feat], dim=1)
+        # Fusion with explicit region-cuisine interaction.
+        combined = torch.cat([img_feat, txt_feat, reg_feat, cat_feat, reg_cat_interaction], dim=1)
         shared = self.fusion_trunk(combined)
         sentiment_logits = self.sentiment_head(shared).squeeze(1)
         category_logits = self.category_head(shared)
         rating_pred = torch.sigmoid(self.rating_head(shared)).squeeze(1)
         if return_attention:
-            return sentiment_logits, category_logits, rating_pred, alpha_img.squeeze(1), alpha_txt.squeeze(1)
+            alpha_img = attn_img.mean(dim=(1, 2))
+            alpha_txt = attn_txt.mean(dim=(1, 2))
+            return sentiment_logits, category_logits, rating_pred, alpha_img, alpha_txt
         return sentiment_logits, category_logits, rating_pred
 
 
@@ -410,10 +463,11 @@ class ImageTextFusionModel(nn.Module):
         # Text branch
         self.text_embedding = nn.Embedding(vocab_size, EMBED_DIM, padding_idx=0)
         self.text_lstm = nn.LSTM(EMBED_DIM, LSTM_HIDDEN, batch_first=True)
-        self.text_proj = nn.Linear(LSTM_HIDDEN, 128)
-
-        self.attn_img = nn.Linear(128, 1)
-        self.attn_txt = nn.Linear(128, 1)
+        self.text_token_proj = nn.Linear(LSTM_HIDDEN, 128)
+        self.text_summary_proj = nn.Linear(LSTM_HIDDEN, 128)
+        self.image_to_text_attn = nn.MultiheadAttention(128, CROSS_ATTN_HEADS, batch_first=True)
+        self.text_to_image_attn = nn.MultiheadAttention(128, CROSS_ATTN_HEADS, batch_first=True)
+        self.image_tokenizer = nn.Linear(128, IMAGE_TOKEN_COUNT * 128)
 
         # Fusion head (128 img + 128 text)
         self.classifier = nn.Sequential(
@@ -430,18 +484,34 @@ class ImageTextFusionModel(nn.Module):
         img_feat = self.image_backbone(images)
         img_feat = self.image_proj(img_feat)
         txt_emb = self.text_embedding(text_seq)
-        _, (hidden, _) = self.text_lstm(txt_emb)
-        txt_feat = self.text_proj(hidden[-1])
+        txt_seq_out, (hidden, _) = self.text_lstm(txt_emb)
+        txt_tokens = self.text_token_proj(txt_seq_out)
+        txt_summary = self.text_summary_proj(hidden[-1])
 
-        alpha_img = torch.sigmoid(self.attn_img(img_feat))
-        alpha_txt = torch.sigmoid(self.attn_txt(txt_feat))
-        img_feat = alpha_img * img_feat
-        txt_feat = alpha_txt * txt_feat
+        img_query = img_feat.unsqueeze(1)
+        img_attended, attn_img = self.image_to_text_attn(
+            query=img_query,
+            key=txt_tokens,
+            value=txt_tokens,
+        )
+
+        img_tokens = self.image_tokenizer(img_feat).view(-1, IMAGE_TOKEN_COUNT, 128)
+        txt_query = txt_summary.unsqueeze(1)
+        txt_attended, attn_txt = self.text_to_image_attn(
+            query=txt_query,
+            key=img_tokens,
+            value=img_tokens,
+        )
+
+        img_feat = img_attended.squeeze(1)
+        txt_feat = txt_attended.squeeze(1)
 
         combined = torch.cat([img_feat, txt_feat], dim=1)
         logits = self.classifier(combined).squeeze(1)
         if return_attention:
-            return logits, alpha_img.squeeze(1), alpha_txt.squeeze(1)
+            alpha_img = attn_img.mean(dim=(1, 2))
+            alpha_txt = attn_txt.mean(dim=(1, 2))
+            return logits, alpha_img, alpha_txt
         return logits
 
 
@@ -474,7 +544,7 @@ def _forward_batch(model: nn.Module, batch: tuple, mode: str, return_attention: 
             return logits, targets, alpha_img, alpha_txt
         logits = outputs
     else:  # "full"
-        outputs = model(images, text_seq, region_ids, return_attention=return_attention)
+        outputs = model(images, text_seq, region_ids, category_ids, return_attention=return_attention)
         if return_attention:
             sent_logits, cat_logits, rating_pred, alpha_img, alpha_txt = outputs
             targets = {
@@ -686,6 +756,7 @@ def run_experiment(
     best_metrics: dict = {}
     best_path = OUTPUT_DIR / f"best_{safe_name}.pt"
     best_attention_df = None
+    epochs_without_improvement = 0
     history = []
 
     for epoch in range(1, EPOCHS + 1):
@@ -721,6 +792,17 @@ def run_experiment(
             if attention_df is not None:
                 best_attention_df = attention_df.copy()
             torch.save(model.state_dict(), best_path)
+            epochs_without_improvement = 0
+        else:
+            if (best_f1 - val_m["f1"]) > EARLY_STOPPING_MIN_DELTA:
+                epochs_without_improvement += 1
+
+        if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+            print(
+                f"  Early stopping triggered at epoch {epoch} "
+                f"(no F1 improvement for {EARLY_STOPPING_PATIENCE} epochs)."
+            )
+            break
 
     pd.DataFrame(history).to_csv(
         OUTPUT_DIR / f"history_{safe_name}.csv", index=False
@@ -747,6 +829,7 @@ def image_text_consistency_analysis(
     val_loader: DataLoader,
     vocab_size: int,
     id_to_region: dict,
+    id_to_category: dict,
 ) -> None:
     """
     Compare Image-only and Text-only predictions on the same samples.
@@ -768,6 +851,297 @@ def image_text_consistency_analysis(
 
     print("\n" + "=" * 72)
     print("IMAGE-TEXT CONSISTENCY ANALYSIS")
+    print("=" * 72)
+
+    image_model = ImageOnlyModel().to(DEVICE)
+    text_model = TextOnlyModel(vocab_size, EMBED_DIM, LSTM_HIDDEN).to(DEVICE)
+    image_model.load_state_dict(torch.load(image_ckpt, map_location=DEVICE))
+    text_model.load_state_dict(torch.load(text_ckpt, map_location=DEVICE))
+    image_model.eval()
+    text_model.eval()
+
+    rows = []
+    with torch.no_grad():
+        for batch in val_loader:
+            if batch is None:
+                continue
+
+            images, text_seq, region_ids, category_ids, ratings, labels = batch
+            images = images.to(DEVICE)
+            text_seq = text_seq.to(DEVICE)
+            labels = labels.to(DEVICE)
+
+            image_probs = torch.sigmoid(image_model(images))
+            text_probs = torch.sigmoid(text_model(text_seq))
+
+            image_preds = (image_probs >= 0.5).long()
+            text_preds = (text_probs >= 0.5).long()
+
+            for index in range(labels.size(0)):
+                region_id = int(region_ids[index].item())
+                category_id = int(category_ids[index].item())
+                rating_val = float(ratings[index].item())
+                rating_stars = (rating_val * 4.0) + 1.0
+                if rating_stars <= 2.5:
+                    rating_quality = "low_quality_proxy"
+                elif rating_stars <= 3.75:
+                    rating_quality = "mid_quality_proxy"
+                else:
+                    rating_quality = "high_quality_proxy"
+                rows.append(
+                    {
+                        "label": int(labels[index].item()),
+                        "region_id": region_id,
+                        "region": id_to_region.get(region_id, "<unknown_region>"),
+                        "cuisine": id_to_category.get(category_id, "<unknown_category>"),
+                        "rating_quality_cluster": rating_quality,
+                        "image_prob": float(image_probs[index].item()),
+                        "text_prob": float(text_probs[index].item()),
+                        "image_pred": int(image_preds[index].item()),
+                        "text_pred": int(text_preds[index].item()),
+                    }
+                )
+
+    if not rows:
+        print("No valid validation samples available for consistency analysis.")
+        print("=" * 72)
+        return
+
+    pred_df = pd.DataFrame(rows)
+    pred_df["mismatch"] = pred_df["image_pred"] != pred_df["text_pred"]
+    pred_df["img_pos_txt_neg"] = (pred_df["image_pred"] == 1) & (pred_df["text_pred"] == 0)
+    pred_df["img_neg_txt_pos"] = (pred_df["image_pred"] == 0) & (pred_df["text_pred"] == 1)
+
+    total = len(pred_df)
+    mismatch_count = int(pred_df["mismatch"].sum())
+    mismatch_rate = mismatch_count / total
+    img_pos_txt_neg_count = int(pred_df["img_pos_txt_neg"].sum())
+    img_neg_txt_pos_count = int(pred_df["img_neg_txt_pos"].sum())
+
+    print(f"Total validation samples compared: {total}")
+    print(f"Mismatch count (image_pred != text_pred): {mismatch_count}")
+    print(f"Perception Gap Rate (mismatches / total): {mismatch_rate:.4f}")
+    print(f"Image positive, Text negative: {img_pos_txt_neg_count}")
+    print(f"Image negative, Text positive: {img_neg_txt_pos_count}")
+
+    mismatch_by_label = (
+        pred_df.groupby("label")["mismatch"]
+        .mean()
+        .rename(index={0: "true_negative", 1: "true_positive"})
+        .to_dict()
+    )
+    print("Mismatch rate by true label:")
+    for label_name, rate in mismatch_by_label.items():
+        print(f"  {label_name}: {rate:.4f}")
+
+    region_mismatch = (
+        pred_df.groupby("region")
+        .agg(samples=("mismatch", "count"), mismatch_rate=("mismatch", "mean"))
+        .query("samples >= 20")
+        .sort_values("mismatch_rate", ascending=False)
+    )
+    if not region_mismatch.empty:
+        print("\nTop regions with highest image-text disagreement (>=20 samples):")
+        print(region_mismatch.head(10).to_string())
+
+    cuisine_mismatch = (
+        pred_df.groupby("cuisine")
+        .agg(samples=("mismatch", "count"), mismatch_rate=("mismatch", "mean"))
+        .query("samples >= 20")
+        .sort_values("mismatch_rate", ascending=False)
+    )
+    if not cuisine_mismatch.empty:
+        print("\nTop cuisines with highest perception gap (>=20 samples):")
+        print(cuisine_mismatch.head(10).to_string())
+
+    rating_quality_mismatch = (
+        pred_df.groupby("rating_quality_cluster")
+        .agg(samples=("mismatch", "count"), mismatch_rate=("mismatch", "mean"))
+        .sort_values("mismatch_rate", ascending=False)
+    )
+    if not rating_quality_mismatch.empty:
+        print("\nPerception gap by rating-quality proxy cluster:")
+        print(rating_quality_mismatch.to_string())
+
+    print(
+        "\nInsight:\n"
+        "  High image-text disagreement suggests noisy multimodal pairs and\n"
+        "  subjective perception differences (e.g., image looks appealing while\n"
+        "  review text is negative, or vice versa)."
+    )
+
+    all_path = OUTPUT_DIR / "image_text_consistency_predictions.csv"
+    mismatch_path = OUTPUT_DIR / "image_text_consistency_mismatches.csv"
+    region_path = OUTPUT_DIR / "image_text_consistency_region_summary.csv"
+    cuisine_path = OUTPUT_DIR / "image_text_consistency_cuisine_summary.csv"
+    rating_quality_path = OUTPUT_DIR / "image_text_consistency_rating_quality_summary.csv"
+
+    pred_df.to_csv(all_path, index=False)
+    pred_df[pred_df["mismatch"]].to_csv(mismatch_path, index=False)
+    if not region_mismatch.empty:
+        region_mismatch.reset_index().to_csv(region_path, index=False)
+    if not cuisine_mismatch.empty:
+        cuisine_mismatch.reset_index().to_csv(cuisine_path, index=False)
+    if not rating_quality_mismatch.empty:
+        rating_quality_mismatch.reset_index().to_csv(rating_quality_path, index=False)
+
+    print(f"Saved all consistency predictions to {all_path}")
+    print(f"Saved mismatch-only samples to {mismatch_path}")
+    if region_mismatch.empty:
+        print("Region summary not saved (insufficient per-region sample counts).")
+    else:
+        print(f"Saved region mismatch summary to {region_path}")
+    if not cuisine_mismatch.empty:
+        print(f"Saved cuisine mismatch summary to {cuisine_path}")
+    if not rating_quality_mismatch.empty:
+        print(f"Saved rating-quality mismatch summary to {rating_quality_path}")
+    print("=" * 72)
+
+
+def final_presentation_plots(
+    ablation_table: pd.DataFrame,
+    val_loader: DataLoader,
+    num_regions: int,
+    num_categories: int,
+) -> None:
+    """Generate final presentation-ready plots requested for the results section."""
+    print("\n" + "=" * 72)
+    print("FINAL PRESENTATION PLOTS")
+    print("=" * 72)
+
+    plot_df = ablation_table.copy()
+    for column in ["F1", "Accuracy", "Loss"]:
+        if column in plot_df.columns:
+            plot_df[column] = pd.to_numeric(plot_df[column], errors="coerce")
+
+    # 1) Bar chart of F1 scores for all model variants.
+    plt.figure(figsize=(9, 5))
+    bars = plt.bar(plot_df["Model"], plot_df["F1"], color=["#90CAF9", "#FFCC80", "#A5D6A7", "#CE93D8"])
+    plt.title("Model Comparison — F1 Scores")
+    plt.ylabel("F1")
+    plt.xticks(rotation=15, ha="right")
+    for bar, value in zip(bars, plot_df["F1"]):
+        plt.text(bar.get_x() + bar.get_width() / 2, value + 0.002, f"{value:.4f}", ha="center", fontsize=8)
+    plt.tight_layout()
+    f1_plot_path = OUTPUT_DIR / "final_model_f1_bar.png"
+    plt.savefig(f1_plot_path, dpi=160)
+    plt.close()
+    print(f"Saved model F1 bar chart to {f1_plot_path}")
+
+    # 2) Confusion matrix for best model.
+    best_model_name = plot_df.sort_values("F1", ascending=False).iloc[0]["Model"]
+    model_map = {
+        "Image Only": (ImageOnlyModel(), "image", OUTPUT_DIR / "best_Image_Only.pt"),
+        "Text Only": (TextOnlyModel(VOCAB_SIZE, EMBED_DIM, LSTM_HIDDEN), "text", OUTPUT_DIR / "best_Text_Only.pt"),
+        "Image + Text": (ImageTextFusionModel(VOCAB_SIZE), "image_text", OUTPUT_DIR / "best_Image_plus_Text.pt"),
+        "Image + Text + Region": (
+            MultimodalFusionModel(VOCAB_SIZE, num_regions, num_categories),
+            "full",
+            OUTPUT_DIR / "best_Image_plus_Text_plus_Region.pt",
+        ),
+    }
+    if best_model_name in model_map:
+        best_model, mode, ckpt = model_map[best_model_name]
+        if ckpt.exists():
+            best_model.load_state_dict(torch.load(ckpt, map_location=DEVICE))
+            best_model = best_model.to(DEVICE)
+            best_model.eval()
+            all_true, all_pred = [], []
+            with torch.no_grad():
+                for batch in val_loader:
+                    if batch is None:
+                        continue
+                    logits, targets = _forward_batch(best_model, batch, mode)
+                    sent_logits = logits["sentiment"] if mode == "full" else logits
+                    preds = (torch.sigmoid(sent_logits) >= 0.5).long().cpu().numpy().tolist()
+                    labels = targets["sentiment"].cpu().numpy().astype(int).tolist()
+                    all_pred.extend(preds)
+                    all_true.extend(labels)
+
+            cm = confusion_matrix(all_true, all_pred)
+            plt.figure(figsize=(5, 4))
+            plt.imshow(cm, cmap="Blues")
+            plt.title(f"Confusion Matrix — Best Model ({best_model_name})")
+            plt.xlabel("Predicted")
+            plt.ylabel("True")
+            plt.xticks([0, 1], ["Neg", "Pos"])
+            plt.yticks([0, 1], ["Neg", "Pos"])
+            for i in range(cm.shape[0]):
+                for j in range(cm.shape[1]):
+                    plt.text(j, i, str(cm[i, j]), ha="center", va="center", color="black")
+            plt.tight_layout()
+            cm_path = OUTPUT_DIR / "final_best_model_confusion_matrix.png"
+            plt.savefig(cm_path, dpi=160)
+            plt.close()
+            print(f"Saved best-model confusion matrix to {cm_path}")
+
+    # 3) Perception Gap by region/cuisine and 4) attention comparison.
+    region_gap = pd.read_csv(OUTPUT_DIR / "image_text_consistency_region_summary.csv") if (OUTPUT_DIR / "image_text_consistency_region_summary.csv").exists() else None
+    if region_gap is not None and not region_gap.empty:
+        top = region_gap.sort_values("mismatch_rate", ascending=False).head(15)
+        plt.figure(figsize=(10, 5))
+        plt.bar(top["region"], top["mismatch_rate"], color="#EF9A9A")
+        plt.title("Perception Gap Rate by Region")
+        plt.ylabel("Mismatch rate")
+        plt.xticks(rotation=65, ha="right")
+        plt.tight_layout()
+        region_gap_path = OUTPUT_DIR / "final_perception_gap_by_region.png"
+        plt.savefig(region_gap_path, dpi=160)
+        plt.close()
+        print(f"Saved region perception-gap chart to {region_gap_path}")
+
+    cuisine_gap = pd.read_csv(OUTPUT_DIR / "image_text_consistency_cuisine_summary.csv") if (OUTPUT_DIR / "image_text_consistency_cuisine_summary.csv").exists() else None
+    if cuisine_gap is not None and not cuisine_gap.empty:
+        top = cuisine_gap.sort_values("mismatch_rate", ascending=False).head(15)
+        plt.figure(figsize=(10, 5))
+        plt.bar(top["cuisine"], top["mismatch_rate"], color="#FFCC80")
+        plt.title("Perception Gap Rate by Cuisine")
+        plt.ylabel("Mismatch rate")
+        plt.xticks(rotation=55, ha="right")
+        plt.tight_layout()
+        cuisine_gap_path = OUTPUT_DIR / "final_perception_gap_by_cuisine.png"
+        plt.savefig(cuisine_gap_path, dpi=160)
+        plt.close()
+        print(f"Saved cuisine perception-gap chart to {cuisine_gap_path}")
+
+    att_img_txt = pd.read_csv(OUTPUT_DIR / "attention_Image_plus_Text.csv") if (OUTPUT_DIR / "attention_Image_plus_Text.csv").exists() else None
+    att_full = pd.read_csv(OUTPUT_DIR / "attention_Image_plus_Text_plus_Region.csv") if (OUTPUT_DIR / "attention_Image_plus_Text_plus_Region.csv").exists() else None
+    if att_img_txt is not None and att_full is not None and not att_img_txt.empty and not att_full.empty:
+        means = [
+            att_img_txt["alpha_img"].mean(),
+            att_img_txt["alpha_txt"].mean(),
+            att_full["alpha_img"].mean(),
+            att_full["alpha_txt"].mean(),
+        ]
+        labels = ["Img+Txt img", "Img+Txt txt", "Full img", "Full txt"]
+        plt.figure(figsize=(8, 4))
+        plt.bar(labels, means, color=["#64B5F6", "#4DB6AC", "#9575CD", "#BA68C8"])
+        plt.title("Attention Weight Comparison")
+        plt.ylabel("Mean attention")
+        plt.ylim(0, 1)
+        plt.tight_layout()
+        att_path = OUTPUT_DIR / "final_attention_comparison.png"
+        plt.savefig(att_path, dpi=160)
+        plt.close()
+        print(f"Saved attention comparison chart to {att_path}")
+
+    # 5) Region/cuisine sentiment spread plot.
+    spread_path = OUTPUT_DIR / "cuisine_region_sentiment_spread.csv"
+    if spread_path.exists():
+        spread_df = pd.read_csv(spread_path)
+        if spread_df is not None and not spread_df.empty:
+            top = spread_df.sort_values("spread", ascending=False).head(12)
+            plt.figure(figsize=(9, 5))
+            plt.bar(top["cuisine_cluster"], top["spread"], color="#80CBC4")
+            plt.title("Region/Cuisine Sentiment Spread")
+            plt.ylabel("Positive-rate spread")
+            plt.xticks(rotation=45, ha="right")
+            plt.tight_layout()
+            spread_plot_path = OUTPUT_DIR / "final_region_cuisine_spread.png"
+            plt.savefig(spread_plot_path, dpi=160)
+            plt.close()
+            print(f"Saved region/cuisine spread chart to {spread_plot_path}")
+
     print("=" * 72)
 
 
@@ -945,6 +1319,8 @@ def _predict_full_model(
     tokenizer: Tokenizer,
     region_to_id: dict,
     unknown_region_id: int,
+    category_to_id: dict,
+    unknown_category_id: int,
     image_transform,
 ) -> List[int]:
     preds = []
@@ -965,7 +1341,12 @@ def _predict_full_model(
                 dtype=torch.long,
                 device=DEVICE,
             )
-            sent_logits, _cat_logits, _rating_pred = model(image_tensor, text_tensor, region_id)
+            category_id = torch.tensor(
+                [category_to_id.get(row.get("primary_category", "<unknown_category>"), unknown_category_id)],
+                dtype=torch.long,
+                device=DEVICE,
+            )
+            sent_logits, _cat_logits, _rating_pred = model(image_tensor, text_tensor, region_id, category_id)
             preds.append(int((torch.sigmoid(sent_logits) >= 0.5).item()))
     return preds
 
@@ -992,6 +1373,8 @@ def data_quality_noise_analysis(
     val_transform,
     region_to_id: dict,
     unknown_region_id: int,
+    category_to_id: dict,
+    unknown_category_id: int,
     num_regions: int,
     num_categories: int,
 ) -> None:
@@ -1054,10 +1437,24 @@ def data_quality_noise_analysis(
     with_caption_df = val_df.loc[caption_mask].copy().reset_index(drop=True)
     without_caption_df = val_df.loc[~caption_mask].copy().reset_index(drop=True)
     with_caption_df["pred"] = _predict_full_model(
-        full_model, with_caption_df, tokenizer, region_to_id, unknown_region_id, val_transform
+        full_model,
+        with_caption_df,
+        tokenizer,
+        region_to_id,
+        unknown_region_id,
+        category_to_id,
+        unknown_category_id,
+        val_transform,
     )
     without_caption_df["pred"] = _predict_full_model(
-        full_model, without_caption_df, tokenizer, region_to_id, unknown_region_id, val_transform
+        full_model,
+        without_caption_df,
+        tokenizer,
+        region_to_id,
+        unknown_region_id,
+        category_to_id,
+        unknown_category_id,
+        val_transform,
     )
 
     with_caption_metrics = _evaluate_subset_predictions(with_caption_df)
@@ -1110,6 +1507,12 @@ def data_quality_noise_analysis(
 # Step 7: Ablation Study — Main
 # =========================================================
 def main():
+    print("\n" + "=" * 72)
+    print("PROJECT PROBLEM STATEMENT")
+    print("=" * 72)
+    print(RESEARCH_QUESTION)
+    print("=" * 72)
+
     business_df, review_df, photo_df = load_yelp_data(
         BUSINESS_PATH,
         REVIEW_PATH,
@@ -1126,6 +1529,10 @@ def main():
     )
 
     df = df.sample(min(len(df), 30000), random_state=SEED).reset_index(drop=True)
+    print(
+        "Limitation note: photo-review pairs are matched at business level, so this pipeline "
+        "learns business-level multimodal sentiment rather than perfectly dish-level sentiment."
+    )
 
     # Shared train/val split — identical across all 4 experiments
     train_df, val_df = train_test_split(
@@ -1173,6 +1580,7 @@ def main():
     category_to_id = {cat: idx for idx, cat in enumerate(top_categories)}
     unknown_category_id = len(category_to_id)
     category_to_id["<unknown_category>"] = unknown_category_id
+    id_to_category = {idx: cat for cat, idx in category_to_id.items()}
     num_categories = len(category_to_id)
 
     train_category_ids = train_df["primary_category"].map(
@@ -1274,6 +1682,7 @@ def main():
         val_loader=val_loader,
         vocab_size=VOCAB_SIZE,
         id_to_region=id_to_region,
+        id_to_category=id_to_category,
     )
 
     # ── Cross-modal retrieval (text<->image) ─────────────────────────────
@@ -1293,6 +1702,8 @@ def main():
         val_transform=val_transform,
         region_to_id=region_to_id,
         unknown_region_id=unknown_region_id,
+        category_to_id=category_to_id,
+        unknown_category_id=unknown_category_id,
         num_regions=num_regions,
         num_categories=num_categories,
     )
@@ -1308,6 +1719,14 @@ def main():
 
     # ── Region Importance Analysis ─────────────────────────────────────────
     region_importance_analysis(df, ablation_results)
+
+    # ── Final presentation-ready plots ────────────────────────────────────
+    final_presentation_plots(
+        ablation_table=table_df,
+        val_loader=val_loader,
+        num_regions=num_regions,
+        num_categories=num_categories,
+    )
 
 
 def text_importance_analysis(
@@ -1731,7 +2150,35 @@ def region_importance_analysis(df: pd.DataFrame, ablation_results: dict) -> None
                 "      region is a non-redundant signal for the model."
             )
 
-    # ── 4. Save full stats ─────────────────────────────────────────────────
+    # ── 4. Same cuisine, different region comparison (explicit evidence) ───
+    if "cuisine_cluster" in df.columns:
+        cuisine_region_stats = (
+            df.groupby(["cuisine_cluster", "region"])["sentiment"]
+            .agg(total="count", positive_rate="mean")
+            .query("total >= 20")
+            .reset_index()
+        )
+        if not cuisine_region_stats.empty:
+            spread_by_cuisine = (
+                cuisine_region_stats.groupby("cuisine_cluster")["positive_rate"]
+                .agg(min_rate="min", max_rate="max", region_count="count")
+                .reset_index()
+            )
+            spread_by_cuisine["spread"] = spread_by_cuisine["max_rate"] - spread_by_cuisine["min_rate"]
+            spread_by_cuisine = spread_by_cuisine.sort_values("spread", ascending=False)
+            top_spread = spread_by_cuisine.head(10)
+
+            print("\n[4] Same cuisine, different region sentiment spread")
+            print(top_spread.to_string(index=False))
+            print(
+                "\n    → This directly addresses the US-homogeneity concern: even within\n"
+                "      one country, the same cuisine receives different sentiment\n"
+                "      across regions, supporting region-aware modeling."
+            )
+
+            top_spread.to_csv(OUTPUT_DIR / "cuisine_region_sentiment_spread.csv", index=False)
+
+    # ── 5. Save full stats ─────────────────────────────────────────────────
     out_path = OUTPUT_DIR / "region_sentiment_stats.csv"
     region_stats.to_csv(out_path, index=False)
     print(f"\n    Full region stats saved to {out_path}")

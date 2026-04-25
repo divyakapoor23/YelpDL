@@ -480,6 +480,31 @@ class ImageTextFusionModel(nn.Module):
             nn.Linear(64, 1),
         )
 
+    def encode_image_text_embeddings(self, images, text_seq):
+        img_feat = self.image_backbone(images)
+        img_feat = self.image_proj(img_feat)
+        txt_emb = self.text_embedding(text_seq)
+        txt_seq_out, (hidden, _) = self.text_lstm(txt_emb)
+        txt_tokens = self.text_token_proj(txt_seq_out)
+        txt_summary = self.text_summary_proj(hidden[-1])
+
+        img_query = img_feat.unsqueeze(1)
+        img_attended, _ = self.image_to_text_attn(
+            query=img_query,
+            key=txt_tokens,
+            value=txt_tokens,
+        )
+
+        img_tokens = self.image_tokenizer(img_feat).view(-1, IMAGE_TOKEN_COUNT, 128)
+        txt_query = txt_summary.unsqueeze(1)
+        txt_attended, _ = self.text_to_image_attn(
+            query=txt_query,
+            key=img_tokens,
+            value=img_tokens,
+        )
+
+        return img_attended.squeeze(1), txt_attended.squeeze(1)
+
     def forward(self, images, text_seq, return_attention: bool = False):
         img_feat = self.image_backbone(images)
         img_feat = self.image_proj(img_feat)
@@ -1195,10 +1220,7 @@ def cross_modal_retrieval_analysis(
             seq = encode_texts(tokenizer, [str(row["review_text"])], max_len=MAX_TEXT_LEN)
             text_tensor = torch.tensor(seq, dtype=torch.long, device=DEVICE)
 
-            img_feat = model.image_proj(model.image_backbone(image_tensor))
-            txt_emb = model.text_embedding(text_tensor)
-            _, (hidden, _) = model.text_lstm(txt_emb)
-            txt_feat = model.text_proj(hidden[-1])
+            img_feat, txt_feat = model.encode_image_text_embeddings(image_tensor, text_tensor)
 
             image_feats.append(F.normalize(img_feat, dim=1).cpu())
             text_feats.append(F.normalize(txt_feat, dim=1).cpu())
@@ -1219,9 +1241,8 @@ def cross_modal_retrieval_analysis(
     q_seq = encode_texts(tokenizer, [query_text], max_len=MAX_TEXT_LEN)
     q_tensor = torch.tensor(q_seq, dtype=torch.long, device=DEVICE)
     with torch.no_grad():
-        q_emb = model.text_embedding(q_tensor)
-        _, (q_hidden, _) = model.text_lstm(q_emb)
-        q_feat = model.text_proj(q_hidden[-1])
+        dummy_image = torch.zeros((1, 3, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.float32, device=DEVICE)
+        _, q_feat = model.encode_image_text_embeddings(dummy_image, q_tensor)
         q_feat = F.normalize(q_feat, dim=1).cpu()
 
     # cosine similarity because vectors are L2-normalized

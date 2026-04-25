@@ -30,6 +30,7 @@ matplotlib.use("Agg")  # non-interactive backend (safe for scripts without a dis
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 
 # =========================================================
@@ -75,6 +76,9 @@ EPOCHS = 5
 LEARNING_RATE = 1e-4
 IMAGE_SIZE = 224
 NUM_WORKERS = min(os.cpu_count() or 1, 4)
+MAX_CATEGORY_CLASSES = 20
+CATEGORY_LOSS_WEIGHT = 0.5
+RATING_LOSS_WEIGHT = 0.3
 
 
 # =========================================================
@@ -97,6 +101,18 @@ def compute_metrics(y_true: List[int], y_pred: List[int]) -> dict:
         "recall": recall_score(y_true, y_pred, zero_division=0),
         "f1": f1_score(y_true, y_pred, zero_division=0),
     }
+
+
+def extract_primary_category(categories: Optional[str]) -> str:
+    if not isinstance(categories, str) or not categories.strip():
+        return "Unknown"
+    first = categories.split(",")[0].strip()
+    return first if first else "Unknown"
+
+
+def scale_rating(rating: float) -> float:
+    # Yelp stars are in [1, 5]. Scale to [0, 1] for stabler regression.
+    return float((rating - 1.0) / 4.0)
 
 
 # =========================================================
@@ -203,6 +219,8 @@ class YelpMultimodalDataset(Dataset):
         df: pd.DataFrame,
         text_sequences: np.ndarray,
         region_ids: np.ndarray,
+        category_ids: np.ndarray,
+        ratings: np.ndarray,
         image_transform=None,
     ):
         # Pre-extract columns as plain Python lists/arrays to avoid slow df.iloc in __getitem__
@@ -210,6 +228,8 @@ class YelpMultimodalDataset(Dataset):
         self.sentiments = df["sentiment"].astype(int).tolist()
         self.text_sequences = text_sequences
         self.region_ids = region_ids
+        self.category_ids = category_ids
+        self.ratings = ratings
         self.image_transform = image_transform
 
     def __len__(self):
@@ -226,9 +246,11 @@ class YelpMultimodalDataset(Dataset):
 
         text_seq = torch.tensor(self.text_sequences[idx], dtype=torch.long)
         region_id = torch.tensor(self.region_ids[idx], dtype=torch.long)
+        category_id = torch.tensor(self.category_ids[idx], dtype=torch.long)
+        rating = torch.tensor(self.ratings[idx], dtype=torch.float32)
         label = torch.tensor(self.sentiments[idx], dtype=torch.float32)
 
-        return image, text_seq, region_id, label
+        return image, text_seq, region_id, category_id, rating, label
 
 
 def safe_collate(batch):
@@ -236,11 +258,13 @@ def safe_collate(batch):
     if not valid_items:
         return None
 
-    images, text_seq, region_ids, labels = zip(*valid_items)
+    images, text_seq, region_ids, category_ids, ratings, labels = zip(*valid_items)
     return (
         torch.stack(images),
         torch.stack(text_seq),
         torch.stack(region_ids),
+        torch.stack(category_ids),
+        torch.stack(ratings),
         torch.stack(labels),
     )
 
@@ -289,7 +313,7 @@ class TextOnlyModel(nn.Module):
 
 
 class MultimodalFusionModel(nn.Module):
-    def __init__(self, vocab_size: int, num_regions: int):
+    def __init__(self, vocab_size: int, num_regions: int, num_categories: int):
         super().__init__()
 
         # Image branch
@@ -311,17 +335,21 @@ class MultimodalFusionModel(nn.Module):
         # Region branch
         self.region_embedding = nn.Embedding(num_regions, REGION_EMBED_DIM)
 
-        # Fusion head
+        # Shared fusion trunk
         fusion_input_dim = 128 + 128 + REGION_EMBED_DIM
-        self.classifier = nn.Sequential(
+        self.fusion_trunk = nn.Sequential(
             nn.Linear(fusion_input_dim, 128),
             nn.ReLU(),
             nn.Dropout(0.4),
             nn.Linear(128, 64),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(64, 1),
         )
+
+        # Multitask heads
+        self.sentiment_head = nn.Linear(64, 1)
+        self.category_head = nn.Linear(64, num_categories)
+        self.rating_head = nn.Linear(64, 1)
 
     def forward(self, images, text_seq, region_ids, return_attention: bool = False):
         # Image features
@@ -343,10 +371,13 @@ class MultimodalFusionModel(nn.Module):
 
         # Fusion
         combined = torch.cat([img_feat, txt_feat, reg_feat], dim=1)
-        logits = self.classifier(combined).squeeze(1)
+        shared = self.fusion_trunk(combined)
+        sentiment_logits = self.sentiment_head(shared).squeeze(1)
+        category_logits = self.category_head(shared)
+        rating_pred = torch.sigmoid(self.rating_head(shared)).squeeze(1)
         if return_attention:
-            return logits, alpha_img.squeeze(1), alpha_txt.squeeze(1)
-        return logits
+            return sentiment_logits, category_logits, rating_pred, alpha_img.squeeze(1), alpha_txt.squeeze(1)
+        return sentiment_logits, category_logits, rating_pred
 
 
 class ImageTextFusionModel(nn.Module):
@@ -405,10 +436,12 @@ class ImageTextFusionModel(nn.Module):
 # =========================================================
 def _forward_batch(model: nn.Module, batch: tuple, mode: str, return_attention: bool = False):
     """Route a batch to the correct model signature based on ablation mode."""
-    images, text_seq, region_ids, labels = batch
+    images, text_seq, region_ids, category_ids, ratings, labels = batch
     images = images.to(DEVICE)
     text_seq = text_seq.to(DEVICE)
     region_ids = region_ids.to(DEVICE)
+    category_ids = category_ids.to(DEVICE)
+    ratings = ratings.to(DEVICE)
     labels = labels.to(DEVICE)
 
     if mode == "image":
@@ -419,58 +452,127 @@ def _forward_batch(model: nn.Module, batch: tuple, mode: str, return_attention: 
         outputs = model(images, text_seq, return_attention=return_attention)
         if return_attention:
             logits, alpha_img, alpha_txt = outputs
-            return logits, labels, alpha_img, alpha_txt
+            targets = {
+                "sentiment": labels,
+                "category": category_ids,
+                "rating": ratings,
+            }
+            return logits, targets, alpha_img, alpha_txt
         logits = outputs
     else:  # "full"
         outputs = model(images, text_seq, region_ids, return_attention=return_attention)
         if return_attention:
-            logits, alpha_img, alpha_txt = outputs
-            return logits, labels, alpha_img, alpha_txt
+            sent_logits, cat_logits, rating_pred, alpha_img, alpha_txt = outputs
+            targets = {
+                "sentiment": labels,
+                "category": category_ids,
+                "rating": ratings,
+            }
+            logits = {
+                "sentiment": sent_logits,
+                "category": cat_logits,
+                "rating": rating_pred,
+            }
+            return logits, targets, alpha_img, alpha_txt
         logits = outputs
 
-    return logits, labels
+    targets = {
+        "sentiment": labels,
+        "category": category_ids,
+        "rating": ratings,
+    }
+    if mode == "full":
+        sent_logits, cat_logits, rating_pred = logits
+        logits = {
+            "sentiment": sent_logits,
+            "category": cat_logits,
+            "rating": rating_pred,
+        }
+    return logits, targets
 
 
-def train_epoch(model: nn.Module, dataloader: DataLoader, optimizer, criterion, mode: str) -> dict:
+def compute_total_loss(logits, targets: dict, criteria: dict, mode: str):
+    if mode != "full":
+        return criteria["sentiment"](logits, targets["sentiment"])
+
+    sentiment_loss = criteria["sentiment"](logits["sentiment"], targets["sentiment"])
+    category_loss = criteria["category"](logits["category"], targets["category"])
+    rating_loss = criteria["rating"](logits["rating"], targets["rating"])
+    total = sentiment_loss + CATEGORY_LOSS_WEIGHT * category_loss + RATING_LOSS_WEIGHT * rating_loss
+    return total, sentiment_loss, category_loss, rating_loss
+
+
+def train_epoch(model: nn.Module, dataloader: DataLoader, optimizer, criteria: dict, mode: str) -> dict:
     model.train()
     running_loss = 0.0
+    running_category_loss = 0.0
+    running_rating_loss = 0.0
     valid_sample_count = 0
     all_preds, all_labels = [], []
+    all_cat_preds, all_cat_labels = [], []
+    rating_abs_error_sum = 0.0
 
     for batch in dataloader:
         if batch is None:
             continue
-        logits, labels = _forward_batch(model, batch, mode)
+        logits, targets = _forward_batch(model, batch, mode)
         optimizer.zero_grad(set_to_none=True)
-        loss = criterion(logits, labels)
+
+        if mode == "full":
+            loss, _, category_loss, rating_loss = compute_total_loss(logits, targets, criteria, mode)
+            sent_logits = logits["sentiment"]
+            cat_logits = logits["category"]
+            rating_pred = logits["rating"]
+        else:
+            loss = compute_total_loss(logits, targets, criteria, mode)
+            sent_logits = logits
+
         loss.backward()
         optimizer.step()
-        running_loss += loss.item() * labels.size(0)
-        valid_sample_count += labels.size(0)
-        preds = (torch.sigmoid(logits) >= 0.5).long().cpu().numpy()
+        running_loss += loss.item() * targets["sentiment"].size(0)
+        valid_sample_count += targets["sentiment"].size(0)
+        preds = (torch.sigmoid(sent_logits) >= 0.5).long().cpu().numpy()
         all_preds.extend(preds.tolist())
-        all_labels.extend(labels.cpu().numpy().astype(int).tolist())
+        all_labels.extend(targets["sentiment"].cpu().numpy().astype(int).tolist())
+
+        if mode == "full":
+            running_category_loss += category_loss.item() * targets["sentiment"].size(0)
+            running_rating_loss += rating_loss.item() * targets["sentiment"].size(0)
+            cat_preds = torch.argmax(cat_logits, dim=1).cpu().numpy()
+            cat_labels = targets["category"].cpu().numpy()
+            all_cat_preds.extend(cat_preds.tolist())
+            all_cat_labels.extend(cat_labels.tolist())
+            rating_abs_error_sum += torch.abs(rating_pred - targets["rating"]).sum().item()
 
     if valid_sample_count == 0:
         raise RuntimeError("No valid training samples were loaded. Check the image files.")
 
     metrics = compute_metrics(all_labels, all_preds)
     metrics["loss"] = running_loss / valid_sample_count
+    if mode == "full" and all_cat_labels:
+        metrics["category_accuracy"] = accuracy_score(all_cat_labels, all_cat_preds)
+        metrics["rating_mae"] = rating_abs_error_sum / valid_sample_count
+        metrics["category_loss"] = running_category_loss / valid_sample_count
+        metrics["rating_loss"] = running_rating_loss / valid_sample_count
     return metrics
 
 
 def eval_epoch(
     model: nn.Module,
     dataloader: DataLoader,
-    criterion,
+    criteria: dict,
     mode: str,
     verbose: bool = False,
     capture_attention: bool = False,
 ) -> Tuple[dict, Optional[pd.DataFrame]]:
     model.eval()
     running_loss = 0.0
+    running_category_loss = 0.0
+    running_rating_loss = 0.0
     valid_sample_count = 0
     all_preds, all_labels = [], []
+    all_cat_preds, all_cat_labels = [], []
+    rating_abs_error_sum = 0.0
     img_attention_values, txt_attention_values = [], []
 
     with torch.no_grad():
@@ -478,7 +580,7 @@ def eval_epoch(
             if batch is None:
                 continue
             if capture_attention and mode in ("image_text", "full"):
-                logits, labels, alpha_img, alpha_txt = _forward_batch(
+                logits, targets, alpha_img, alpha_txt = _forward_batch(
                     model,
                     batch,
                     mode,
@@ -487,19 +589,42 @@ def eval_epoch(
                 img_attention_values.extend(alpha_img.detach().cpu().numpy().tolist())
                 txt_attention_values.extend(alpha_txt.detach().cpu().numpy().tolist())
             else:
-                logits, labels = _forward_batch(model, batch, mode)
-            loss = criterion(logits, labels)
-            running_loss += loss.item() * labels.size(0)
-            valid_sample_count += labels.size(0)
-            preds = (torch.sigmoid(logits) >= 0.5).long().cpu().numpy()
+                logits, targets = _forward_batch(model, batch, mode)
+
+            if mode == "full":
+                loss, _, category_loss, rating_loss = compute_total_loss(logits, targets, criteria, mode)
+                sent_logits = logits["sentiment"]
+                cat_logits = logits["category"]
+                rating_pred = logits["rating"]
+            else:
+                loss = compute_total_loss(logits, targets, criteria, mode)
+                sent_logits = logits
+
+            running_loss += loss.item() * targets["sentiment"].size(0)
+            valid_sample_count += targets["sentiment"].size(0)
+            preds = (torch.sigmoid(sent_logits) >= 0.5).long().cpu().numpy()
             all_preds.extend(preds.tolist())
-            all_labels.extend(labels.cpu().numpy().astype(int).tolist())
+            all_labels.extend(targets["sentiment"].cpu().numpy().astype(int).tolist())
+
+            if mode == "full":
+                running_category_loss += category_loss.item() * targets["sentiment"].size(0)
+                running_rating_loss += rating_loss.item() * targets["sentiment"].size(0)
+                cat_preds = torch.argmax(cat_logits, dim=1).cpu().numpy()
+                cat_labels = targets["category"].cpu().numpy()
+                all_cat_preds.extend(cat_preds.tolist())
+                all_cat_labels.extend(cat_labels.tolist())
+                rating_abs_error_sum += torch.abs(rating_pred - targets["rating"]).sum().item()
 
     if valid_sample_count == 0:
         raise RuntimeError("No valid validation samples were loaded. Check the image files.")
 
     metrics = compute_metrics(all_labels, all_preds)
     metrics["loss"] = running_loss / valid_sample_count
+    if mode == "full" and all_cat_labels:
+        metrics["category_accuracy"] = accuracy_score(all_cat_labels, all_cat_preds)
+        metrics["rating_mae"] = rating_abs_error_sum / valid_sample_count
+        metrics["category_loss"] = running_category_loss / valid_sample_count
+        metrics["rating_loss"] = running_rating_loss / valid_sample_count
     if verbose:
         print("\nClassification Report:")
         print(classification_report(all_labels, all_preds, digits=4, zero_division=0))
@@ -536,7 +661,11 @@ def run_experiment(
     print(f"{'='*64}")
 
     model = model.to(DEVICE)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    criteria = {
+        "sentiment": nn.BCEWithLogitsLoss(pos_weight=pos_weight),
+        "category": nn.CrossEntropyLoss(),
+        "rating": nn.L1Loss(),
+    }
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     best_f1 = -1.0
@@ -547,11 +676,11 @@ def run_experiment(
 
     for epoch in range(1, EPOCHS + 1):
         is_last = epoch == EPOCHS
-        train_m = train_epoch(model, train_loader, optimizer, criterion, mode)
+        train_m = train_epoch(model, train_loader, optimizer, criteria, mode)
         val_m, attention_df = eval_epoch(
             model,
             val_loader,
-            criterion,
+            criteria,
             mode,
             verbose=is_last,
             capture_attention=mode in ("image_text", "full"),
@@ -640,7 +769,7 @@ def image_text_consistency_analysis(
             if batch is None:
                 continue
 
-            images, text_seq, region_ids, labels = batch
+            images, text_seq, region_ids, _category_ids, _ratings, labels = batch
             images = images.to(DEVICE)
             text_seq = text_seq.to(DEVICE)
             labels = labels.to(DEVICE)
@@ -789,6 +918,30 @@ def main():
     if unseen_val_regions:
         print(f"Validation regions unseen in train: {unseen_val_regions}")
 
+    # Category target (classification): use primary category token
+    train_df = train_df.copy()
+    val_df = val_df.copy()
+    train_df["primary_category"] = train_df["categories"].apply(extract_primary_category)
+    val_df["primary_category"] = val_df["categories"].apply(extract_primary_category)
+
+    top_categories = train_df["primary_category"].value_counts().head(MAX_CATEGORY_CLASSES).index.tolist()
+    category_to_id = {cat: idx for idx, cat in enumerate(top_categories)}
+    unknown_category_id = len(category_to_id)
+    category_to_id["<unknown_category>"] = unknown_category_id
+    num_categories = len(category_to_id)
+
+    train_category_ids = train_df["primary_category"].map(
+        lambda c: category_to_id.get(c, unknown_category_id)
+    ).to_numpy(dtype=np.int64)
+    val_category_ids = val_df["primary_category"].map(
+        lambda c: category_to_id.get(c, unknown_category_id)
+    ).to_numpy(dtype=np.int64)
+    print(f"Number of category classes (with unknown): {num_categories}")
+
+    # Rating target (regression): normalized review stars in [0, 1]
+    train_ratings = train_df["review_stars"].astype(float).apply(scale_rating).to_numpy(dtype=np.float32)
+    val_ratings = val_df["review_stars"].astype(float).apply(scale_rating).to_numpy(dtype=np.float32)
+
     # Image transforms
     train_transform = transforms.Compose([
         transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
@@ -805,10 +958,20 @@ def main():
     # Shared DataLoaders (same data across all 4 experiments)
     _pin = DEVICE.type == "cuda"
     train_dataset = YelpMultimodalDataset(
-        train_df, X_train_text, train_region_ids, image_transform=train_transform
+        train_df,
+        X_train_text,
+        train_region_ids,
+        train_category_ids,
+        train_ratings,
+        image_transform=train_transform,
     )
     val_dataset = YelpMultimodalDataset(
-        val_df, X_val_text, val_region_ids, image_transform=val_transform
+        val_df,
+        X_val_text,
+        val_region_ids,
+        val_category_ids,
+        val_ratings,
+        image_transform=val_transform,
     )
     train_loader = DataLoader(
         train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS,
@@ -824,7 +987,7 @@ def main():
         ("Image Only",            ImageOnlyModel(),                                    "image"),
         ("Text Only",             TextOnlyModel(VOCAB_SIZE, EMBED_DIM, LSTM_HIDDEN),   "text"),
         ("Image + Text",          ImageTextFusionModel(VOCAB_SIZE),                    "image_text"),
-        ("Image + Text + Region", MultimodalFusionModel(VOCAB_SIZE, num_regions),      "full"),
+        ("Image + Text + Region", MultimodalFusionModel(VOCAB_SIZE, num_regions, num_categories), "full"),
     ]
 
     ablation_results: dict = {}
@@ -835,7 +998,7 @@ def main():
     # ── Print comparison table ─────────────────────────────────────────────
     rows = []
     for exp_name, m in ablation_results.items():
-        rows.append({
+        row = {
             "Model":      exp_name,
             "Best Epoch": m["best_epoch"],
             "Accuracy":   f"{m['val_accuracy']:.4f}",
@@ -843,7 +1006,12 @@ def main():
             "Recall":     f"{m['val_recall']:.4f}",
             "F1":         f"{m['val_f1']:.4f}",
             "Loss":       f"{m['val_loss']:.4f}",
-        })
+        }
+        if "val_category_accuracy" in m:
+            row["Category Acc"] = f"{m['val_category_accuracy']:.4f}"
+        if "val_rating_mae" in m:
+            row["Rating MAE"] = f"{m['val_rating_mae']:.4f}"
+        rows.append(row)
 
     table_df = pd.DataFrame(rows)
 
@@ -863,6 +1031,9 @@ def main():
         id_to_region=id_to_region,
     )
 
+    # ── Text Importance Analysis (TF-IDF) ────────────────────────────────
+    text_importance_analysis(train_df)
+
     # ── Visual Feature Analysis (CNN embeddings) ──────────────────────────
     visual_feature_analysis(
         val_loader=val_loader,
@@ -871,6 +1042,146 @@ def main():
 
     # ── Region Importance Analysis ─────────────────────────────────────────
     region_importance_analysis(df, ablation_results)
+
+
+def text_importance_analysis(
+    train_df: pd.DataFrame,
+    top_n: int = 20,
+    max_features: int = 30000,
+    ngram_range: tuple = (1, 2),
+) -> None:
+    """
+    TF-IDF word importance analysis.
+
+    Splits training text by sentiment class and uses TF-IDF to surface the
+    terms most strongly associated with positive vs negative reviews.
+    Also plots horizontal bar charts of top keywords per class.
+    """
+    print("\n" + "=" * 72)
+    print("TEXT IMPORTANCE ANALYSIS (TF-IDF)")
+    print("=" * 72)
+
+    pos_texts = train_df.loc[train_df["sentiment"] == 1, "review_text"].tolist()
+    neg_texts = train_df.loc[train_df["sentiment"] == 0, "review_text"].tolist()
+
+    print(f"Training reviews — positive: {len(pos_texts)}, negative: {len(neg_texts)}")
+
+    # ── Fit one TF-IDF on ALL train text, then compare mean scores per class
+    all_texts = pos_texts + neg_texts
+    all_labels = [1] * len(pos_texts) + [0] * len(neg_texts)
+
+    tfidf = TfidfVectorizer(
+        max_features=max_features,
+        ngram_range=ngram_range,
+        stop_words="english",
+        sublinear_tf=True,       # log(1+tf) — dampens very frequent terms
+        min_df=5,
+    )
+    X = tfidf.fit_transform(all_texts)
+    terms = np.array(tfidf.get_feature_names_out())
+
+    labels_arr = np.array(all_labels)
+    pos_mask = labels_arr == 1
+    neg_mask = labels_arr == 0
+
+    # Mean TF-IDF score per term for each class
+    pos_mean = np.asarray(X[pos_mask].mean(axis=0)).ravel()
+    neg_mean = np.asarray(X[neg_mask].mean(axis=0)).ravel()
+
+    # Discriminative score: how much more a term appears in one class
+    pos_score = pos_mean - neg_mean   # high → more positive
+    neg_score = neg_mean - pos_mean   # high → more negative
+
+    top_pos_idx = np.argsort(pos_score)[::-1][:top_n]
+    top_neg_idx = np.argsort(neg_score)[::-1][:top_n]
+
+    top_pos_terms  = terms[top_pos_idx]
+    top_pos_scores = pos_score[top_pos_idx]
+    top_neg_terms  = terms[top_neg_idx]
+    top_neg_scores = neg_score[top_neg_idx]
+
+    # ── Console summary ────────────────────────────────────────────────────
+    print(f"\nTop {top_n} POSITIVE sentiment keywords (TF-IDF discriminative score):")
+    for term, score in zip(top_pos_terms, top_pos_scores):
+        bar = "█" * int(score * 3000)
+        print(f"  {term:<30s}  {score:.5f}  {bar}")
+
+    print(f"\nTop {top_n} NEGATIVE sentiment keywords (TF-IDF discriminative score):")
+    for term, score in zip(top_neg_terms, top_neg_scores):
+        bar = "█" * int(score * 3000)
+        print(f"  {term:<30s}  {score:.5f}  {bar}")
+
+    # ── Bar chart: positive keywords ───────────────────────────────────────
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    axes[0].barh(
+        top_pos_terms[::-1], top_pos_scores[::-1],
+        color="#2196F3", edgecolor="none",
+    )
+    axes[0].set_title(f"Top {top_n} Positive Keywords (TF-IDF)", fontsize=12)
+    axes[0].set_xlabel("Discriminative score (pos − neg mean TF-IDF)")
+    axes[0].invert_xaxis()
+    axes[0].yaxis.set_label_position("right")
+    axes[0].yaxis.tick_right()
+
+    axes[1].barh(
+        top_neg_terms[::-1], top_neg_scores[::-1],
+        color="#F44336", edgecolor="none",
+    )
+    axes[1].set_title(f"Top {top_n} Negative Keywords (TF-IDF)", fontsize=12)
+    axes[1].set_xlabel("Discriminative score (neg − pos mean TF-IDF)")
+
+    fig.suptitle("TF-IDF Sentiment Keyword Analysis", fontsize=14, y=1.01)
+    plt.tight_layout()
+    kw_plot_path = OUTPUT_DIR / "text_tfidf_keywords.png"
+    fig.savefig(kw_plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\nSaved keyword bar chart to {kw_plot_path}")
+
+    # ── Save CSV: full term scores ─────────────────────────────────────────
+    term_df = pd.DataFrame({
+        "term":      terms,
+        "pos_mean":  pos_mean,
+        "neg_mean":  neg_mean,
+        "pos_score": pos_score,
+        "neg_score": neg_score,
+    }).sort_values("pos_score", ascending=False)
+    csv_path = OUTPUT_DIR / "text_tfidf_term_scores.csv"
+    term_df.to_csv(csv_path, index=False)
+    print(f"Saved full term score table to {csv_path}")
+
+    # ── Region-level keyword drift ─────────────────────────────────────────
+    # Are different words used positively in different regions?
+    if "region" in train_df.columns:
+        top_regions = (
+            train_df["region"].value_counts().head(6).index.tolist()
+        )
+        region_top_pos: dict = {}
+        for region in top_regions:
+            region_texts = train_df.loc[
+                (train_df["region"] == region) & (train_df["sentiment"] == 1),
+                "review_text",
+            ].tolist()
+            if len(region_texts) < 20:
+                continue
+            rv = TfidfVectorizer(
+                max_features=5000, ngram_range=(1, 1),
+                stop_words="english", sublinear_tf=True, min_df=2,
+            )
+            rv.fit(region_texts)
+            scores = np.asarray(rv.transform(region_texts).mean(axis=0)).ravel()
+            top_idx = np.argsort(scores)[::-1][:5]
+            region_top_pos[region] = list(zip(
+                rv.get_feature_names_out()[top_idx], scores[top_idx]
+            ))
+
+        if region_top_pos:
+            print("\nTop positive keywords by region (shows regional language variation):")
+            for region, kws in region_top_pos.items():
+                kw_str = ", ".join(f"{w} ({s:.4f})" for w, s in kws)
+                print(f"  {region:<30s}  {kw_str}")
+
+    print("=" * 72)
 
 
 def visual_feature_analysis(
@@ -887,7 +1198,7 @@ def visual_feature_analysis(
       2. Region (top-N most-frequent)
     Saved as PNG files in outputs/.
     """
-    ckpt_path = OUTPUT_DIR / "best_Image_plusText_plusRegion.pt"
+    ckpt_path = OUTPUT_DIR / "best_Image_plus_Text_plus_Region.pt"
     # Fallback: try Image Only checkpoint if full model not found
     if not ckpt_path.exists():
         ckpt_path = OUTPUT_DIR / "best_Image_Only.pt"
@@ -932,7 +1243,7 @@ def visual_feature_analysis(
         for batch in val_loader:
             if batch is None:
                 continue
-            images, _text, region_ids, labels = batch
+            images, _text, region_ids, _category_ids, _ratings, labels = batch
             images = images.to(DEVICE)
             feats = backbone(images).cpu().numpy()   # (B, 512)
             all_features.append(feats)
@@ -964,7 +1275,7 @@ def visual_feature_analysis(
         n_components=n_tsne_components,
         perplexity=perplexity,
         random_state=SEED,
-        n_iter=500,
+        max_iter=500,
         init="pca",
     )
     emb = tsne.fit_transform(features_pca)

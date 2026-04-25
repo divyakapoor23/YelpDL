@@ -19,6 +19,7 @@ from sklearn.metrics import (
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models, transforms
 
@@ -756,6 +757,149 @@ def image_text_consistency_analysis(
     print("IMAGE-TEXT CONSISTENCY ANALYSIS")
     print("=" * 72)
 
+
+def cross_modal_retrieval_analysis(
+    val_df: pd.DataFrame,
+    tokenizer: Tokenizer,
+    val_transform,
+    max_pool_size: int = 2000,
+    top_k: int = 5,
+    query_text: str = "spicy ramen",
+) -> None:
+    """
+    Cross-modal retrieval demo using learned joint representations.
+
+    Tasks:
+    1. Text -> retrieve matching images
+    2. Image -> retrieve matching reviews
+    """
+    print("\n" + "=" * 72)
+    print("CROSS-MODAL RETRIEVAL ANALYSIS")
+    print("=" * 72)
+
+    ckpt_path = OUTPUT_DIR / "best_Image_plus_Text.pt"
+    if not ckpt_path.exists():
+        print(f"Skipping retrieval: missing checkpoint {ckpt_path}")
+        print("=" * 72)
+        return
+
+    pool_df = val_df.head(min(len(val_df), max_pool_size)).reset_index(drop=True)
+    if pool_df.empty:
+        print("Skipping retrieval: empty validation pool.")
+        print("=" * 72)
+        return
+
+    model = ImageTextFusionModel(VOCAB_SIZE).to(DEVICE)
+    model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
+    model.eval()
+
+    image_feats = []
+    text_feats = []
+    valid_indices = []
+
+    with torch.no_grad():
+        for idx, row in pool_df.iterrows():
+            try:
+                image = Image.open(row["image_path"]).convert("RGB")
+            except (UnidentifiedImageError, OSError):
+                continue
+
+            image_tensor = val_transform(image).unsqueeze(0).to(DEVICE)
+            seq = encode_texts(tokenizer, [str(row["review_text"])], max_len=MAX_TEXT_LEN)
+            text_tensor = torch.tensor(seq, dtype=torch.long, device=DEVICE)
+
+            img_feat = model.image_proj(model.image_backbone(image_tensor))
+            txt_emb = model.text_embedding(text_tensor)
+            _, (hidden, _) = model.text_lstm(txt_emb)
+            txt_feat = model.text_proj(hidden[-1])
+
+            image_feats.append(F.normalize(img_feat, dim=1).cpu())
+            text_feats.append(F.normalize(txt_feat, dim=1).cpu())
+            valid_indices.append(idx)
+
+    if not valid_indices:
+        print("Skipping retrieval: no valid image-text pairs after filtering.")
+        print("=" * 72)
+        return
+
+    image_mat = torch.cat(image_feats, dim=0)  # (N, D)
+    text_mat = torch.cat(text_feats, dim=0)    # (N, D)
+    valid_df = pool_df.iloc[valid_indices].reset_index(drop=True)
+
+    # ---------------------------------------------------------
+    # Text -> Image retrieval (example query: "spicy ramen")
+    # ---------------------------------------------------------
+    q_seq = encode_texts(tokenizer, [query_text], max_len=MAX_TEXT_LEN)
+    q_tensor = torch.tensor(q_seq, dtype=torch.long, device=DEVICE)
+    with torch.no_grad():
+        q_emb = model.text_embedding(q_tensor)
+        _, (q_hidden, _) = model.text_lstm(q_emb)
+        q_feat = model.text_proj(q_hidden[-1])
+        q_feat = F.normalize(q_feat, dim=1).cpu()
+
+    # cosine similarity because vectors are L2-normalized
+    text_to_img_scores = torch.matmul(image_mat, q_feat.squeeze(0))
+    top_img_idx = torch.topk(text_to_img_scores, k=min(top_k, len(valid_df))).indices.numpy().tolist()
+
+    print(f"\n[1] Text -> Image retrieval for query: '{query_text}'")
+    text_to_img_rows = []
+    for rank, ridx in enumerate(top_img_idx, start=1):
+        row = valid_df.iloc[ridx]
+        score = float(text_to_img_scores[ridx].item())
+        snippet = str(row["review_text"])[:120].replace("\n", " ")
+        print(f"  #{rank}  score={score:.4f}  image={row['image_path']}")
+        print(f"      review: {snippet}...")
+        text_to_img_rows.append(
+            {
+                "rank": rank,
+                "query": query_text,
+                "similarity": score,
+                "image_path": row["image_path"],
+                "region": row.get("region", ""),
+                "sentiment": int(row["sentiment"]),
+                "review_text": str(row["review_text"]),
+            }
+        )
+
+    # ---------------------------------------------------------
+    # Image -> Text retrieval (use first pool image as demo query)
+    # ---------------------------------------------------------
+    query_image_idx = 0
+    q_img_feat = image_mat[query_image_idx]
+    img_to_text_scores = torch.matmul(text_mat, q_img_feat)
+    top_txt_idx = torch.topk(img_to_text_scores, k=min(top_k, len(valid_df))).indices.numpy().tolist()
+
+    query_img_path = valid_df.iloc[query_image_idx]["image_path"]
+    print(f"\n[2] Image -> Text retrieval for image: {query_img_path}")
+    img_to_text_rows = []
+    for rank, ridx in enumerate(top_txt_idx, start=1):
+        row = valid_df.iloc[ridx]
+        score = float(img_to_text_scores[ridx].item())
+        snippet = str(row["review_text"])[:140].replace("\n", " ")
+        print(f"  #{rank}  score={score:.4f}  region={row.get('region', '')}  sentiment={int(row['sentiment'])}")
+        print(f"      review: {snippet}...")
+        img_to_text_rows.append(
+            {
+                "rank": rank,
+                "query_image_path": query_img_path,
+                "similarity": score,
+                "matched_image_path": row["image_path"],
+                "region": row.get("region", ""),
+                "sentiment": int(row["sentiment"]),
+                "review_text": str(row["review_text"]),
+            }
+        )
+
+    pd.DataFrame(text_to_img_rows).to_csv(
+        OUTPUT_DIR / "retrieval_text_to_image.csv", index=False
+    )
+    pd.DataFrame(img_to_text_rows).to_csv(
+        OUTPUT_DIR / "retrieval_image_to_text.csv", index=False
+    )
+    print(f"\nSaved text->image results to {OUTPUT_DIR / 'retrieval_text_to_image.csv'}")
+    print(f"Saved image->text results to {OUTPUT_DIR / 'retrieval_image_to_text.csv'}")
+    print("=" * 72)
+
     image_model = ImageOnlyModel().to(DEVICE)
     text_model = TextOnlyModel(vocab_size, EMBED_DIM, LSTM_HIDDEN).to(DEVICE)
     image_model.load_state_dict(torch.load(image_ckpt, map_location=DEVICE))
@@ -1029,6 +1173,16 @@ def main():
         val_loader=val_loader,
         vocab_size=VOCAB_SIZE,
         id_to_region=id_to_region,
+    )
+
+    # ── Cross-modal retrieval (text<->image) ─────────────────────────────
+    cross_modal_retrieval_analysis(
+        val_df=val_df,
+        tokenizer=tokenizer,
+        val_transform=val_transform,
+        max_pool_size=2000,
+        top_k=5,
+        query_text="spicy ramen",
     )
 
     # ── Text Importance Analysis (TF-IDF) ────────────────────────────────

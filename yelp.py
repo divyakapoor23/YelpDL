@@ -1,3 +1,4 @@
+import math
 import os
 import random
 from pathlib import Path
@@ -441,9 +442,8 @@ class MultimodalFusionModel(nn.Module):
         category_logits = self.category_head(shared)
         rating_pred = torch.sigmoid(self.rating_head(shared)).squeeze(1)
         if return_attention:
-            alpha_img = attn_img.mean(dim=(1, 2))
-            alpha_txt = attn_txt.mean(dim=(1, 2))
-            return sentiment_logits, category_logits, rating_pred, alpha_img, alpha_txt
+            attention_stats = build_attention_stats(attn_img, attn_txt)
+            return sentiment_logits, category_logits, rating_pred, attention_stats
         return sentiment_logits, category_logits, rating_pred
 
 
@@ -534,15 +534,45 @@ class ImageTextFusionModel(nn.Module):
         combined = torch.cat([img_feat, txt_feat], dim=1)
         logits = self.classifier(combined).squeeze(1)
         if return_attention:
-            alpha_img = attn_img.mean(dim=(1, 2))
-            alpha_txt = attn_txt.mean(dim=(1, 2))
-            return logits, alpha_img, alpha_txt
+            attention_stats = build_attention_stats(attn_img, attn_txt)
+            return logits, attention_stats
         return logits
 
 
 # =========================================================
 # Step 6: Training and evaluation
 # =========================================================
+def _normalized_attention_concentration(attn_weights: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return normalized peak focus and entropy-based concentration per sample."""
+    weights = attn_weights.clamp_min(1e-12)
+    key_count = weights.size(-1)
+    peak = weights.amax(dim=-1).mean(dim=-1)
+    if key_count <= 1:
+        ones = torch.ones(weights.size(0), device=weights.device)
+        return ones, ones
+
+    uniform = 1.0 / key_count
+    peak_focus = ((peak - uniform) / (1.0 - uniform)).clamp(0.0, 1.0)
+    entropy = -(weights * weights.log()).sum(dim=-1)
+    entropy = entropy / math.log(key_count)
+    concentration = (1.0 - entropy).mean(dim=-1).clamp(0.0, 1.0)
+    return peak_focus, concentration
+
+
+def build_attention_stats(attn_img: torch.Tensor, attn_txt: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Build per-sample attention statistics that remain informative after softmax normalization."""
+    img_peak_focus, img_concentration = _normalized_attention_concentration(attn_img)
+    txt_peak_focus, txt_concentration = _normalized_attention_concentration(attn_txt)
+    return {
+        "alpha_img": attn_img.mean(dim=(1, 2)),
+        "alpha_txt": attn_txt.mean(dim=(1, 2)),
+        "img_peak_focus": img_peak_focus,
+        "txt_peak_focus": txt_peak_focus,
+        "img_concentration": img_concentration,
+        "txt_concentration": txt_concentration,
+    }
+
+
 def _forward_batch(model: nn.Module, batch: tuple, mode: str, return_attention: bool = False):
     """Route a batch to the correct model signature based on ablation mode."""
     images, text_seq, region_ids, category_ids, ratings, labels = batch
@@ -560,18 +590,18 @@ def _forward_batch(model: nn.Module, batch: tuple, mode: str, return_attention: 
     elif mode == "image_text":
         outputs = model(images, text_seq, return_attention=return_attention)
         if return_attention:
-            logits, alpha_img, alpha_txt = outputs
+            logits, attention_stats = outputs
             targets = {
                 "sentiment": labels,
                 "category": category_ids,
                 "rating": ratings,
             }
-            return logits, targets, alpha_img, alpha_txt
+            return logits, targets, attention_stats
         logits = outputs
     else:  # "full"
         outputs = model(images, text_seq, region_ids, category_ids, return_attention=return_attention)
         if return_attention:
-            sent_logits, cat_logits, rating_pred, alpha_img, alpha_txt = outputs
+            sent_logits, cat_logits, rating_pred, attention_stats = outputs
             targets = {
                 "sentiment": labels,
                 "category": category_ids,
@@ -582,7 +612,7 @@ def _forward_batch(model: nn.Module, batch: tuple, mode: str, return_attention: 
                 "category": cat_logits,
                 "rating": rating_pred,
             }
-            return logits, targets, alpha_img, alpha_txt
+            return logits, targets, attention_stats
         logits = outputs
 
     targets = {
@@ -682,21 +712,19 @@ def eval_epoch(
     all_preds, all_labels = [], []
     all_cat_preds, all_cat_labels = [], []
     rating_abs_error_sum = 0.0
-    img_attention_values, txt_attention_values = [], []
+    attention_records = []
 
     with torch.no_grad():
         for batch in dataloader:
             if batch is None:
                 continue
             if capture_attention and mode in ("image_text", "full"):
-                logits, targets, alpha_img, alpha_txt = _forward_batch(
+                logits, targets, attention_stats = _forward_batch(
                     model,
                     batch,
                     mode,
                     return_attention=True,
                 )
-                img_attention_values.extend(alpha_img.detach().cpu().numpy().tolist())
-                txt_attention_values.extend(alpha_txt.detach().cpu().numpy().tolist())
             else:
                 logits, targets = _forward_batch(model, batch, mode)
 
@@ -711,9 +739,31 @@ def eval_epoch(
 
             running_loss += loss.item() * targets["sentiment"].size(0)
             valid_sample_count += targets["sentiment"].size(0)
-            preds = (torch.sigmoid(sent_logits) >= 0.5).long().cpu().numpy()
-            all_preds.extend(preds.tolist())
-            all_labels.extend(targets["sentiment"].cpu().numpy().astype(int).tolist())
+            pred_probs = torch.sigmoid(sent_logits).detach().cpu().numpy()
+            preds = (pred_probs >= 0.5).astype(int).tolist()
+            labels = targets["sentiment"].cpu().numpy().astype(int).tolist()
+            all_preds.extend(preds)
+            all_labels.extend(labels)
+
+            if capture_attention and mode in ("image_text", "full"):
+                stats_cpu = {name: tensor.detach().cpu().numpy().tolist() for name, tensor in attention_stats.items()}
+                for index, pred in enumerate(preds):
+                    label = int(labels[index])
+                    probability = float(pred_probs[index])
+                    attention_records.append(
+                        {
+                            "alpha_img": float(stats_cpu["alpha_img"][index]),
+                            "alpha_txt": float(stats_cpu["alpha_txt"][index]),
+                            "img_peak_focus": float(stats_cpu["img_peak_focus"][index]),
+                            "txt_peak_focus": float(stats_cpu["txt_peak_focus"][index]),
+                            "img_concentration": float(stats_cpu["img_concentration"][index]),
+                            "txt_concentration": float(stats_cpu["txt_concentration"][index]),
+                            "sentiment_label": label,
+                            "sentiment_pred": int(pred),
+                            "correct": int(int(pred) == label),
+                            "pred_confidence": max(probability, 1.0 - probability),
+                        }
+                    )
 
             if mode == "full":
                 running_category_loss += category_loss.item() * targets["sentiment"].size(0)
@@ -741,17 +791,14 @@ def eval_epoch(
         print(confusion_matrix(all_labels, all_preds))
 
     attention_df = None
-    if capture_attention and mode in ("image_text", "full") and img_attention_values:
-        attention_df = pd.DataFrame(
-            {
-                "alpha_img": img_attention_values,
-                "alpha_txt": txt_attention_values,
-            }
-        )
+    if capture_attention and mode in ("image_text", "full") and attention_records:
+        attention_df = pd.DataFrame(attention_records)
         metrics["attention_img_mean"] = float(attention_df["alpha_img"].mean())
         metrics["attention_txt_mean"] = float(attention_df["alpha_txt"].mean())
         metrics["attention_img_std"] = float(attention_df["alpha_img"].std(ddof=0))
         metrics["attention_txt_std"] = float(attention_df["alpha_txt"].std(ddof=0))
+        metrics["attention_img_focus"] = float(attention_df["img_concentration"].mean())
+        metrics["attention_txt_focus"] = float(attention_df["txt_concentration"].mean())
     return metrics, attention_df
 
 
@@ -837,13 +884,9 @@ def run_experiment(
         summary_path = OUTPUT_DIR / f"attention_{safe_name}_summary.csv"
         best_attention_df.to_csv(attention_path, index=False)
         best_attention_df.describe(percentiles=[0.1, 0.25, 0.5, 0.75, 0.9]).to_csv(summary_path)
-        img_mean = best_attention_df["alpha_img"].mean()
-        txt_mean = best_attention_df["alpha_txt"].mean()
-        img_pref_rate = (best_attention_df["alpha_img"] > best_attention_df["alpha_txt"]).mean()
-        print(
-            f"  Attention mean (img/txt): {img_mean:.4f} / {txt_mean:.4f} | "
-            f"img>txt rate: {img_pref_rate:.4f}"
-        )
+        img_focus = best_attention_df["img_concentration"].mean() if "img_concentration" in best_attention_df.columns else np.nan
+        txt_focus = best_attention_df["txt_concentration"].mean() if "txt_concentration" in best_attention_df.columns else np.nan
+        print(f"  Attention concentration (img/txt): {img_focus:.4f} / {txt_focus:.4f}")
         print(f"  Saved attention weights to {attention_path}")
         print(f"  Saved attention summary to {summary_path}")
     print(f"  Best Val F1: {best_f1:.4f} (epoch {best_metrics['best_epoch']})")
@@ -1132,17 +1175,30 @@ def final_presentation_plots(
     att_img_txt = pd.read_csv(OUTPUT_DIR / "attention_Image_plus_Text.csv") if (OUTPUT_DIR / "attention_Image_plus_Text.csv").exists() else None
     att_full = pd.read_csv(OUTPUT_DIR / "attention_Image_plus_Text_plus_Region.csv") if (OUTPUT_DIR / "attention_Image_plus_Text_plus_Region.csv").exists() else None
     if att_img_txt is not None and att_full is not None and not att_img_txt.empty and not att_full.empty:
-        means = [
-            att_img_txt["alpha_img"].mean(),
-            att_img_txt["alpha_txt"].mean(),
-            att_full["alpha_img"].mean(),
-            att_full["alpha_txt"].mean(),
-        ]
-        labels = ["Img+Txt img", "Img+Txt txt", "Full img", "Full txt"]
+        if {"img_concentration", "txt_concentration"}.issubset(att_img_txt.columns) and {"img_concentration", "txt_concentration"}.issubset(att_full.columns):
+            means = [
+                att_img_txt["img_concentration"].mean(),
+                att_img_txt["txt_concentration"].mean(),
+                att_full["img_concentration"].mean(),
+                att_full["txt_concentration"].mean(),
+            ]
+            labels = ["Img+Txt image focus", "Img+Txt text focus", "Full image focus", "Full text focus"]
+            title = "Attention Focus Comparison"
+            ylabel = "Normalized concentration"
+        else:
+            means = [
+                att_img_txt["alpha_img"].mean(),
+                att_img_txt["alpha_txt"].mean(),
+                att_full["alpha_img"].mean(),
+                att_full["alpha_txt"].mean(),
+            ]
+            labels = ["Img+Txt img", "Img+Txt txt", "Full img", "Full txt"]
+            title = "Attention Weight Comparison"
+            ylabel = "Mean attention"
         plt.figure(figsize=(8, 4))
         plt.bar(labels, means, color=["#64B5F6", "#4DB6AC", "#9575CD", "#BA68C8"])
-        plt.title("Attention Weight Comparison")
-        plt.ylabel("Mean attention")
+        plt.title(title)
+        plt.ylabel(ylabel)
         plt.ylim(0, 1)
         plt.tight_layout()
         att_path = OUTPUT_DIR / "final_attention_comparison.png"

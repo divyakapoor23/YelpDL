@@ -352,8 +352,8 @@ def _render_region_impact_callout(ablation: pd.DataFrame, key_prefix: str = "ove
 def render_attention() -> None:
 	st.header("Attention")
 	st.caption(
-		"Cross-modal attention shows how the model balances image and text evidence. "
-		"This page focuses on modality share and stability so the comparison answers whether region meaningfully changes that balance."
+		"This page is presentation-focused: it shows how sharp each attention stream is, whether region changes that focus, "
+		"and whether mistakes come with flatter attention patterns."
 	)
 
 	att_no_region = load_csv(OUTPUT_DIR / "attention_Image_plus_Text.csv")
@@ -361,22 +361,36 @@ def render_attention() -> None:
 	att_no_region_summary = load_csv(OUTPUT_DIR / "attention_Image_plus_Text_summary.csv")
 	att_region_summary = load_csv(OUTPUT_DIR / "attention_Image_plus_Text_plus_Region_summary.csv")
 
+	def _callout_card(title: str, value: str, note: str) -> None:
+		with st.container(border=True):
+			st.markdown(f"**{title}**")
+			st.markdown(
+				f"<div style='font-size: 2rem; font-weight: 700; line-height: 1.1; margin: 0.25rem 0 0.35rem 0;'>{value}</div>",
+				unsafe_allow_html=True,
+			)
+			st.caption(note)
+
 	def _prepare_attention_frame(df: pd.DataFrame | None, label: str) -> pd.DataFrame | None:
 		if df is None or df.empty:
 			return None
-		clean = df[["alpha_img", "alpha_txt"]].apply(pd.to_numeric, errors="coerce").dropna().copy()
+		required = [
+			"img_concentration",
+			"txt_concentration",
+			"img_peak_focus",
+			"txt_peak_focus",
+			"correct",
+			"pred_confidence",
+		]
+		if not set(required).issubset(df.columns):
+			return None
+		clean = df.copy()
+		for column in required:
+			clean[column] = pd.to_numeric(clean[column], errors="coerce")
+		clean = clean.dropna(subset=required)
 		if clean.empty:
 			return None
-		total_alpha = clean["alpha_img"] + clean["alpha_txt"]
-		clean = clean.loc[total_alpha > 0].copy()
-		if clean.empty:
-			return None
-		total_alpha = clean["alpha_img"] + clean["alpha_txt"]
-		clean["image_share"] = clean["alpha_img"] / total_alpha
-		clean["text_share"] = clean["alpha_txt"] / total_alpha
-		clean["balance_gap"] = clean["text_share"] - clean["image_share"]
-		clean["dominant_modality"] = "Text"
-		clean.loc[clean["image_share"] > clean["text_share"], "dominant_modality"] = "Image"
+		clean["correct"] = clean["correct"].astype(int)
+		clean["outcome"] = clean["correct"].map({1: "Correct", 0: "Incorrect"})
 		clean["model"] = label
 		return clean
 
@@ -387,153 +401,141 @@ def render_attention() -> None:
 	prepared_frames = [frame for frame in prepared_frames if frame is not None]
 
 	if not prepared_frames:
-		st.info("Run yelp.py first to generate attention outputs.")
+		st.warning(
+			"The attention page now expects the richer export fields from yelp.py. Rerun yelp.py once to refresh the attention CSVs and unlock the new charts."
+		)
+		with st.expander("Raw exported summary CSVs"):
+			s1, s2 = st.columns(2)
+			with s1:
+				st.markdown("**Image + Text Summary**")
+				if att_no_region_summary is None or att_no_region_summary.empty:
+					st.info("No summary CSV found for Image + Text attention.")
+				else:
+					st.dataframe(att_no_region_summary, use_container_width=True)
+			with s2:
+				st.markdown("**Image + Text + Region Summary**")
+				if att_region_summary is None or att_region_summary.empty:
+					st.info("No summary CSV found for Image + Text + Region attention.")
+				else:
+					st.dataframe(att_region_summary, use_container_width=True)
 		return
 
 	combined = pd.concat(prepared_frames, ignore_index=True)
-
 	model_summary = (
 		combined.groupby("model", as_index=False)
 		.agg(
 			samples=("model", "size"),
-			mean_alpha_img=("alpha_img", "mean"),
-			mean_alpha_txt=("alpha_txt", "mean"),
-			mean_image_share=("image_share", "mean"),
-			mean_text_share=("text_share", "mean"),
-			text_dominant_rate=("dominant_modality", lambda s: (s == "Text").mean()),
-			median_gap=("balance_gap", "median"),
-			share_std=("text_share", "std"),
+			image_focus=("img_concentration", "mean"),
+			text_focus=("txt_concentration", "mean"),
+			image_peak=("img_peak_focus", "mean"),
+			text_peak=("txt_peak_focus", "mean"),
+			accuracy=("correct", "mean"),
+			confidence=("pred_confidence", "mean"),
 		)
 	)
-	model_summary["share_std"] = model_summary["share_std"].fillna(0.0)
 
-	st.subheader("What Attention Is Saying")
-	metric_cols = st.columns(len(model_summary))
-	for idx, (_, row) in enumerate(model_summary.iterrows()):
-		with metric_cols[idx]:
-			st.markdown(f"**{row['model']}**")
-			metric_card("Text share", f"{row['mean_text_share']:.1%}")
-			metric_card("Image share", f"{row['mean_image_share']:.1%}")
-			metric_card("Text-dominant samples", f"{row['text_dominant_rate']:.1%}")
+	overall_text_focus = float(model_summary["text_focus"].mean())
+	overall_image_focus = float(model_summary["image_focus"].mean())
+	text_minus_image = overall_text_focus - overall_image_focus
+	correct_focus = float(combined.loc[combined["correct"] == 1, "txt_concentration"].mean()) if (combined["correct"] == 1).any() else float("nan")
+	incorrect_focus = float(combined.loc[combined["correct"] == 0, "txt_concentration"].mean()) if (combined["correct"] == 0).any() else float("nan")
+	mistake_gap = correct_focus - incorrect_focus if pd.notna(correct_focus) and pd.notna(incorrect_focus) else float("nan")
+	region_delta = None
+	base = model_summary.set_index("model")
+	if {"Image + Text", "Image + Text + Region"}.issubset(base.index):
+		region_delta = float(base.loc["Image + Text + Region", "text_focus"] - base.loc["Image + Text", "text_focus"])
 
-	share_chart = model_summary.melt(
+	st.subheader("Headline Takeaways")
+	card1, card2, card3 = st.columns(3)
+	with card1:
+		focus_winner = "Text stream sharper" if text_minus_image >= 0 else "Image stream sharper"
+		_callout_card(
+			"Main takeaway",
+			focus_winner,
+			f"Average focus gap: {abs(text_minus_image):.1%} between the two cross-attention streams.",
+		)
+	with card2:
+		if region_delta is None:
+			_callout_card("Region effect", "N/A", "Both multimodal models are needed to compare region impact.")
+		else:
+			region_value = f"{region_delta:+.1%}"
+			region_note = "Change in text-side focus after adding region context."
+			_callout_card("Region effect", region_value, region_note)
+	with card3:
+		if pd.isna(mistake_gap):
+			_callout_card("Error pattern", "N/A", "No correct/incorrect split was available in the export.")
+		else:
+			mistake_value = f"{mistake_gap:+.1%}"
+			mistake_note = "Correct predictions typically have higher text-focus concentration than errors." if mistake_gap >= 0 else "Errors are showing sharper text focus than correct predictions in this run."
+			_callout_card("Error pattern", mistake_value, mistake_note)
+
+	focus_chart = model_summary.melt(
 		id_vars="model",
-		value_vars=["mean_image_share", "mean_text_share"],
-		var_name="metric",
-		value_name="share",
+		value_vars=["image_focus", "text_focus"],
+		var_name="modality",
+		value_name="focus",
 	)
-	share_chart["metric"] = share_chart["metric"].map(
-		{"mean_image_share": "Image share", "mean_text_share": "Text share"}
-	)
-	fig_share = px.bar(
-		share_chart,
+	focus_chart["modality"] = focus_chart["modality"].map({"image_focus": "Image focus", "text_focus": "Text focus"})
+	fig_focus = px.bar(
+		focus_chart,
 		x="model",
-		y="share",
-		color="metric",
+		y="focus",
+		color="modality",
 		barmode="group",
-		text="share",
-		title="Normalized Modality Share by Model",
-		labels={"model": "Model", "share": "Average share of attention", "metric": "Modality"},
+		text="focus",
+		title="How Focused Is Each Attention Stream?",
+		labels={"model": "Model", "focus": "Normalized concentration", "modality": "Attention stream"},
 	)
-	fig_share.update_traces(texttemplate="%{text:.1%}", textposition="outside")
-	fig_share.update_yaxes(tickformat=".0%", range=[0, 1])
-	st.plotly_chart(fig_share, use_container_width=True, key="attn_share_by_model")
+	fig_focus.update_traces(texttemplate="%{text:.1%}", textposition="outside")
+	fig_focus.update_yaxes(tickformat=".0%", range=[0, 1])
+	st.plotly_chart(fig_focus, use_container_width=True, key="attn_focus_by_model")
 	st.caption(
-		"These shares are normalized within each sample before averaging, so the chart shows modality balance directly instead of raw alpha magnitudes."
+		"A value closer to 1 means the attention distribution is more concentrated on a small set of tokens or patches; closer to 0 means it is flatter and more diffuse."
 	)
 
-	dominance_chart = model_summary.melt(
-		id_vars="model",
-		value_vars=["text_dominant_rate"],
-		var_name="metric",
-		value_name="rate",
+	outcome_summary = (
+		combined.groupby(["model", "outcome"], as_index=False)
+		.agg(
+			image_focus=("img_concentration", "mean"),
+			text_focus=("txt_concentration", "mean"),
+			samples=("correct", "size"),
+		)
 	)
-	dominance_chart["metric"] = "Text-dominant samples"
-	fig_dominance = px.bar(
-		dominance_chart,
-		x="model",
-		y="rate",
-		color="metric",
-		text="rate",
-		title="How Often Text Receives More Attention Than Image",
-		labels={"model": "Model", "rate": "Share of samples", "metric": "Finding"},
-	)
-	fig_dominance.update_traces(texttemplate="%{text:.1%}", textposition="outside")
-	fig_dominance.update_yaxes(tickformat=".0%", range=[0, 1])
-	st.plotly_chart(fig_dominance, use_container_width=True, key="attn_dominance_rate")
+	if outcome_summary["outcome"].nunique() > 1:
+		rich_chart = outcome_summary.melt(
+			id_vars=["model", "outcome", "samples"],
+			value_vars=["image_focus", "text_focus"],
+			var_name="modality",
+			value_name="focus",
+		)
+		rich_chart["modality"] = rich_chart["modality"].map({"image_focus": "Image focus", "text_focus": "Text focus"})
+		fig_outcome = px.bar(
+			rich_chart,
+			x="outcome",
+			y="focus",
+			color="model",
+			facet_col="modality",
+			barmode="group",
+			text="focus",
+			title="Do Mistakes Come With Flatter Attention?",
+			labels={"outcome": "Prediction outcome", "focus": "Mean normalized concentration", "model": "Model"},
+		)
+		fig_outcome.update_traces(texttemplate="%{text:.1%}", textposition="outside")
+		fig_outcome.update_yaxes(tickformat=".0%", range=[0, 1])
+		st.plotly_chart(fig_outcome, use_container_width=True, key="attn_focus_by_outcome")
+		st.caption(
+			"This richer chart uses the new yelp.py export fields. It compares attention sharpness for correct versus incorrect predictions instead of only showing overall averages."
+		)
 
-	spread_chart = combined.melt(
-		id_vars="model",
-		value_vars=["image_share", "text_share"],
-		var_name="metric",
-		value_name="share",
-	)
-	spread_chart["metric"] = spread_chart["metric"].map({"image_share": "Image share", "text_share": "Text share"})
-	fig_spread = px.box(
-		spread_chart,
-		x="metric",
-		y="share",
-		color="model",
-		points=False,
-		title="Sample-to-Sample Stability of Attention Share",
-		labels={"metric": "Modality", "share": "Per-sample normalized share", "model": "Model"},
-	)
-	fig_spread.update_yaxes(tickformat=".0%", range=[0, 1])
-	st.plotly_chart(fig_spread, use_container_width=True, key="attn_share_stability")
+	if region_delta is not None and abs(region_delta) < 0.01:
+		st.info(
+			"Adding region barely changes attention sharpness. In this run, region helps mainly through the fused representation rather than by making cross-attention much more focused."
+		)
+	elif region_delta is not None:
+		st.info(
+			"Adding region produces a visible shift in attention sharpness, which suggests the geographic signal changes how selectively the model attends to text or image evidence."
+		)
 
-	if len(model_summary) == 2:
-		st.divider()
-		st.subheader("What Region Changes")
-		base = model_summary.set_index("model")
-		if {"Image + Text", "Image + Text + Region"}.issubset(base.index):
-			shift_df = pd.DataFrame(
-				{
-					"metric": ["Image share", "Text share", "Text-dominant rate", "Raw image α", "Raw text α"],
-					"delta": [
-						base.loc["Image + Text + Region", "mean_image_share"] - base.loc["Image + Text", "mean_image_share"],
-						base.loc["Image + Text + Region", "mean_text_share"] - base.loc["Image + Text", "mean_text_share"],
-						base.loc["Image + Text + Region", "text_dominant_rate"] - base.loc["Image + Text", "text_dominant_rate"],
-						base.loc["Image + Text + Region", "mean_alpha_img"] - base.loc["Image + Text", "mean_alpha_img"],
-						base.loc["Image + Text + Region", "mean_alpha_txt"] - base.loc["Image + Text", "mean_alpha_txt"],
-					],
-				}
-			)
-			fig_shift = px.bar(
-				shift_df,
-				x="metric",
-				y="delta",
-				text="delta",
-				title="Delta After Adding Region (With Region - Without Region)",
-				labels={"metric": "Metric", "delta": "Change"},
-			)
-			fig_shift.update_traces(texttemplate="%{text:.4f}", textposition="outside")
-			st.plotly_chart(fig_shift, use_container_width=True, key="attn_region_shift")
-
-			share_delta = abs(float(shift_df.loc[shift_df["metric"] == "Text share", "delta"].iloc[0]))
-			stability_peak = float(model_summary["share_std"].max())
-			if share_delta < 0.01 and stability_peak < 0.01:
-				st.info(
-					"Attention is highly stable across samples and almost unchanged by region. The practical takeaway is that this model relies on text much more than image, and region improves results through other parts of the representation rather than by changing the image-vs-text balance."
-				)
-			else:
-				st.info(
-					"Adding region shifts modality balance enough to be visible here, so region is interacting with how the model weighs image and text evidence."
-				)
-
-	st.divider()
-	st.subheader("Attention Summary Tables")
-	st.dataframe(
-		model_summary.assign(
-			mean_alpha_img=lambda df: df["mean_alpha_img"].map(lambda value: f"{value:.6f}"),
-			mean_alpha_txt=lambda df: df["mean_alpha_txt"].map(lambda value: f"{value:.6f}"),
-			mean_image_share=lambda df: df["mean_image_share"].map(lambda value: f"{value:.2%}"),
-			mean_text_share=lambda df: df["mean_text_share"].map(lambda value: f"{value:.2%}"),
-			text_dominant_rate=lambda df: df["text_dominant_rate"].map(lambda value: f"{value:.2%}"),
-			median_gap=lambda df: df["median_gap"].map(lambda value: f"{value:.2%}"),
-			share_std=lambda df: df["share_std"].map(lambda value: f"{value:.4%}"),
-		),
-		use_container_width=True,
-	)
 	with st.expander("Raw exported summary CSVs"):
 		s1, s2 = st.columns(2)
 		with s1:
@@ -1147,12 +1149,24 @@ def render_research_insights() -> None:
 		)
 
 	if attention_df is not None and not attention_df.empty:
-		img_mean = float(attention_df["alpha_img"].mean())
-		txt_mean = float(attention_df["alpha_txt"].mean())
-		img_gt_txt = float((attention_df["alpha_img"] > attention_df["alpha_txt"]).mean())
-		insights.append(
-			f"Cross-modal attention summary: mean image-attention **{img_mean:.4f}**, mean text-attention **{txt_mean:.4f}**, image-dominant samples **{img_gt_txt:.2%}**."
-		)
+		if {"img_concentration", "txt_concentration", "correct"}.issubset(attention_df.columns):
+			img_focus = float(attention_df["img_concentration"].mean())
+			txt_focus = float(attention_df["txt_concentration"].mean())
+			correct_focus = float(attention_df.loc[attention_df["correct"] == 1, "txt_concentration"].mean())
+			incorrect_focus = float(attention_df.loc[attention_df["correct"] == 0, "txt_concentration"].mean())
+			insights.append(
+				f"Cross-modal attention is sharper on text than image in the exported focus scores: image focus **{img_focus:.4f}**, text focus **{txt_focus:.4f}**."
+			)
+			if pd.notna(correct_focus) and pd.notna(incorrect_focus):
+				insights.append(
+					f"Prediction errors are associated with a text-focus shift of **{(correct_focus - incorrect_focus):+.4f}** compared with correct predictions."
+				)
+		else:
+			img_mean = float(attention_df["alpha_img"].mean())
+			txt_mean = float(attention_df["alpha_txt"].mean())
+			insights.append(
+				f"Legacy attention export detected: mean image-attention **{img_mean:.4f}**, mean text-attention **{txt_mean:.4f}**."
+			)
 
 	if mismatch_df is not None and not mismatch_df.empty:
 		gap = float(mismatch_df["mismatch"].mean())

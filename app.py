@@ -113,7 +113,7 @@ def render_overview() -> None:
 	)
 	fig.update_traces(texttemplate="%{text:.4f}", textposition="outside")
 	fig.update_layout(showlegend=False, height=420)
-	st.plotly_chart(fig, use_container_width=True)
+	st.plotly_chart(fig, use_container_width=True, key="overview_ablation_f1_bar")
 
 	st.subheader("Ablation Table")
 	st.dataframe(chart_df, use_container_width=True)
@@ -126,7 +126,7 @@ def render_overview() -> None:
 	# ── Region impact callout ────────────────────────────────────────────────
 	st.divider()
 	st.subheader("🌍 Does Adding Region Help?")
-	_render_region_impact_callout(ablation)
+	_render_region_impact_callout(ablation, key_prefix="overview")
 
 
 def _render_ablation_written_results(ablation: pd.DataFrame) -> None:
@@ -290,7 +290,7 @@ def _render_ablation_written_results(ablation: pd.DataFrame) -> None:
 		)
 
 
-def _render_region_impact_callout(ablation: pd.DataFrame) -> None:
+def _render_region_impact_callout(ablation: pd.DataFrame, key_prefix: str = "overview") -> None:
 	"""Inline helper that shows a focused with vs without region comparison."""
 	def f1_for(name: str) -> float | None:
 		rows = ablation[ablation["Model"] == name]
@@ -345,7 +345,7 @@ def _render_region_impact_callout(ablation: pd.DataFrame) -> None:
 		color_discrete_sequence=["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"],
 	)
 	fig.update_layout(height=420, legend_title="Metric")
-	st.plotly_chart(fig, use_container_width=True)
+	st.plotly_chart(fig, use_container_width=True, key=f"region_callout_metrics_bar_{key_prefix}")
 
 
 
@@ -358,6 +358,8 @@ def render_attention() -> None:
 
 	att_no_region = load_csv(OUTPUT_DIR / "attention_Image_plus_Text.csv")
 	att_region = load_csv(OUTPUT_DIR / "attention_Image_plus_Text_plus_Region.csv")
+	att_no_region_summary = load_csv(OUTPUT_DIR / "attention_Image_plus_Text_summary.csv")
+	att_region_summary = load_csv(OUTPUT_DIR / "attention_Image_plus_Text_plus_Region_summary.csv")
 
 	# ── Side-by-side comparison ───────────────────────────────────────────────
 	left, right = st.columns(2)
@@ -381,7 +383,7 @@ def render_attention() -> None:
 			nbins=40,
 			title=f"Attention Distribution — {label}",
 		)
-		st.plotly_chart(fig, use_container_width=True)
+		st.plotly_chart(fig, use_container_width=True, key=f"attn_hist_{label.replace(' ', '_').replace('+', 'plus')}")
 
 	with left:
 		_render_attention_panel(att_no_region, "Image + Text (no region)")
@@ -425,7 +427,23 @@ def render_attention() -> None:
 			title="Attention Weight Distribution: With vs Without Region",
 			opacity=0.7,
 		)
-		st.plotly_chart(fig, use_container_width=True)
+		st.plotly_chart(fig, use_container_width=True, key="attn_combined_histogram")
+
+	st.divider()
+	st.subheader("Attention Summary Tables")
+	s1, s2 = st.columns(2)
+	with s1:
+		st.markdown("**Image + Text Summary**")
+		if att_no_region_summary is None or att_no_region_summary.empty:
+			st.info("No summary CSV found for Image + Text attention.")
+		else:
+			st.dataframe(att_no_region_summary, use_container_width=True)
+	with s2:
+		st.markdown("**Image + Text + Region Summary**")
+		if att_region_summary is None or att_region_summary.empty:
+			st.info("No summary CSV found for Image + Text + Region attention.")
+		else:
+			st.dataframe(att_region_summary, use_container_width=True)
 
 
 def render_retrieval() -> None:
@@ -456,8 +474,9 @@ def render_retrieval() -> None:
 
 
 def render_consistency() -> None:
-	st.header("Consistency")
+	st.header("Perception Gap")
 	mismatch_df = load_csv(OUTPUT_DIR / "image_text_consistency_predictions.csv")
+	mismatch_only_df = load_csv(OUTPUT_DIR / "image_text_consistency_mismatches.csv")
 	region_summary = load_csv(OUTPUT_DIR / "image_text_consistency_region_summary.csv")
 	cuisine_summary = load_csv(OUTPUT_DIR / "image_text_consistency_cuisine_summary.csv")
 	rating_quality_summary = load_csv(OUTPUT_DIR / "image_text_consistency_rating_quality_summary.csv")
@@ -482,7 +501,7 @@ def render_consistency() -> None:
 			title="Top Regions by Perception Gap",
 			color="mismatch_rate",
 		)
-		st.plotly_chart(fig, use_container_width=True)
+		st.plotly_chart(fig, use_container_width=True, key="consistency_region_bar")
 
 	c1, c2 = st.columns(2)
 	with c1:
@@ -494,7 +513,7 @@ def render_consistency() -> None:
 				color="mismatch_rate",
 				title="Perception Gap by Cuisine",
 			)
-			st.plotly_chart(fig, use_container_width=True)
+			st.plotly_chart(fig, use_container_width=True, key="consistency_cuisine_bar")
 	with c2:
 		if rating_quality_summary is not None and not rating_quality_summary.empty:
 			fig = px.bar(
@@ -504,10 +523,68 @@ def render_consistency() -> None:
 				color="mismatch_rate",
 				title="Perception Gap by Rating-Quality Proxy",
 			)
-			st.plotly_chart(fig, use_container_width=True)
-
+			st.plotly_chart(fig, use_container_width=True, key="consistency_rating_bar")
 	st.subheader("Mismatch Samples")
-	st.dataframe(mismatch_df[mismatch_df["mismatch"]].head(100), use_container_width=True)
+	if mismatch_only_df is not None and not mismatch_only_df.empty:
+		st.dataframe(mismatch_only_df.head(100), use_container_width=True)
+	else:
+		st.dataframe(mismatch_df[mismatch_df["mismatch"]].head(100), use_container_width=True)
+
+
+def render_presentation_plots() -> None:
+	st.header("Presentation Plots")
+	st.caption("Static presentation-ready figures exported by yelp.py for slides, reports, and final writeups.")
+
+	plot_specs = [
+		(
+			"Model F1 Comparison",
+			OUTPUT_DIR / "final_model_f1_bar.png",
+			"Talk track: start with the main result. Point out which model performs best and emphasize whether adding region improves over Image + Text.",
+		),
+		(
+			"Best-Model Confusion Matrix",
+			OUTPUT_DIR / "final_best_model_confusion_matrix.png",
+			"Talk track: explain where the best model is still making mistakes. This helps you discuss false positives vs false negatives instead of only headline accuracy.",
+		),
+		(
+			"Perception Gap by Region",
+			OUTPUT_DIR / "final_perception_gap_by_region.png",
+			"Talk track: use this to argue that sentiment is not uniform across locations. Some regions show much larger disagreement between image and text perception.",
+		),
+		(
+			"Perception Gap by Cuisine",
+			OUTPUT_DIR / "final_perception_gap_by_cuisine.png",
+			"Talk track: highlight that the perception gap also depends on cuisine type, which suggests some food categories are visually or textually easier to judge than others.",
+		),
+		(
+			"Attention Comparison",
+			OUTPUT_DIR / "final_attention_comparison.png",
+			"Talk track: explain how the model balances image vs text information. Use this figure to describe whether region changes modality reliance.",
+		),
+		(
+			"Region/Cuisine Spread",
+			OUTPUT_DIR / "final_region_cuisine_spread.png",
+			"Talk track: close by showing that the same cuisine can receive different sentiment across regions, which is your strongest justification for region-aware modeling.",
+		),
+	]
+
+	available = [(title, path, talk_track) for title, path, talk_track in plot_specs if path.exists()]
+	missing = [title for title, path, _ in plot_specs if not path.exists()]
+
+	if not available:
+		st.info("No final presentation plots found. Run yelp.py to generate the PNG exports.")
+		return
+
+	if missing:
+		st.warning("Some presentation plots are still missing: " + ", ".join(missing))
+
+	for idx in range(0, len(available), 2):
+		cols = st.columns(2)
+		for col, (title, path, talk_track) in zip(cols, available[idx:idx + 2]):
+			with col:
+				st.subheader(title)
+				st.image(str(path), caption=path.name, use_container_width=True)
+				st.caption(talk_track)
 
 
 def render_text_analysis() -> None:
@@ -564,7 +641,7 @@ def render_visual_features() -> None:
 			opacity=0.65,
 		)
 	fig.update_traces(marker=dict(size=5))
-	st.plotly_chart(fig, use_container_width=True)
+	st.plotly_chart(fig, use_container_width=True, key="visual_tsne_scatter")
 
 	image_cols = st.columns(3)
 	for column, image_name in zip(
@@ -614,7 +691,7 @@ def _render_noise_analysis(noise_df: pd.DataFrame | None) -> None:
 	)
 	fig_overview.update_traces(textposition="outside")
 	fig_overview.update_layout(yaxis_range=[0, 1.1])
-	st.plotly_chart(fig_overview, use_container_width=True)
+	st.plotly_chart(fig_overview, use_container_width=True, key="noise_overview_f1_bar")
 
 	col1, col2, col3 = st.columns(3)
 
@@ -646,7 +723,7 @@ def _render_noise_analysis(noise_df: pd.DataFrame | None) -> None:
 			)
 			fig.update_traces(textposition="outside")
 			fig.update_layout(showlegend=False, yaxis_range=[0, 1.1])
-			st.plotly_chart(fig, use_container_width=True)
+			st.plotly_chart(fig, use_container_width=True, key="noise_review_length_bar")
 
 			# Written interpretation
 			if f1_s is not None and f1_l is not None:
@@ -699,7 +776,7 @@ def _render_noise_analysis(noise_df: pd.DataFrame | None) -> None:
 			)
 			fig.update_traces(textposition="outside")
 			fig.update_layout(showlegend=False, yaxis_range=[0, 1.1])
-			st.plotly_chart(fig, use_container_width=True)
+			st.plotly_chart(fig, use_container_width=True, key="noise_caption_availability_bar")
 
 			# Written interpretation
 			if f1_w is not None and f1_wo is not None:
@@ -751,7 +828,7 @@ def _render_noise_analysis(noise_df: pd.DataFrame | None) -> None:
 			)
 			fig.update_traces(textposition="outside")
 			fig.update_layout(showlegend=False, yaxis_range=[0, 1.1])
-			st.plotly_chart(fig, use_container_width=True)
+			st.plotly_chart(fig, use_container_width=True, key="noise_image_quality_bar")
 
 			# Written interpretation
 			if f1_lo is not None and f1_hi is not None:
@@ -833,7 +910,7 @@ def render_region_and_quality() -> None:
 			if col in ablation.columns:
 				ablation[col] = pd.to_numeric(ablation[col], errors="coerce")
 		st.subheader("📊 Region Impact on Model Performance")
-		_render_region_impact_callout(ablation)
+		_render_region_impact_callout(ablation, key_prefix="region_quality_tab")
 		st.divider()
 
 	region_df = load_csv(OUTPUT_DIR / "region_sentiment_stats.csv")
@@ -851,7 +928,7 @@ def render_region_and_quality() -> None:
 				color="positive_rate",
 				title="Most Positive Regions",
 			)
-			st.plotly_chart(fig, use_container_width=True)
+			st.plotly_chart(fig, use_container_width=True, key="region_positive_rate_bar")
 
 			heatmap_df = region_df.copy()
 			heatmap_df["bucket"] = pd.cut(
@@ -869,7 +946,7 @@ def render_region_and_quality() -> None:
 				title="Region Variation Heatmap (Sentiment Bucket Density)",
 			)
 			fig.update_xaxes(showticklabels=False)
-			st.plotly_chart(fig, use_container_width=True)
+			st.plotly_chart(fig, use_container_width=True, key="region_bucket_density_heatmap")
 
 	with right:
 		st.subheader("Data Quality / Noise Overview")
@@ -889,7 +966,7 @@ def render_region_and_quality() -> None:
 			)
 			fig.update_traces(textposition="outside")
 			fig.update_layout(yaxis_range=[0, 1.1])
-			st.plotly_chart(fig, use_container_width=True)
+			st.plotly_chart(fig, use_container_width=True, key="region_tab_noise_overview_bar")
 		if spread_df is not None and not spread_df.empty:
 			st.subheader("Same Cuisine, Different Region")
 			st.dataframe(spread_df.head(15), use_container_width=True)
@@ -939,7 +1016,7 @@ def render_research_insights() -> None:
 
 	# ── Region impact — pinned at the top as the primary finding ─────────────
 	st.subheader("🌍 Key Finding: Does Region Context Help?")
-	_render_region_impact_callout(ablation)
+	_render_region_impact_callout(ablation, key_prefix="research_tab")
 	st.divider()
 
 	insights = []
@@ -1031,35 +1108,38 @@ def main() -> None:
 	st.title("Yelp Multimodal Analysis App")
 	st.caption(RESEARCH_QUESTION)
 
-	overview_tab, attention_tab, retrieval_tab, consistency_tab, text_tab, visual_tab, region_tab, insights_tab = st.tabs(
+	overview_tab, presentation_tab, insights_tab, region_tab, attention_tab, consistency_tab, retrieval_tab, text_tab, visual_tab = st.tabs(
 		[
 			"Overview",
+			"Presentation Plots",
+			"Research Insights",
+			"Region Effects",
 			"Attention",
+			"Perception Gap",
 			"Retrieval",
-			"Consistency",
 			"Text",
 			"Visual",
-			"Region + Quality",
-			"Research Insights",
 		]
 	)
 
 	with overview_tab:
 		render_overview()
+	with presentation_tab:
+		render_presentation_plots()
+	with insights_tab:
+		render_research_insights()
+	with region_tab:
+		render_region_and_quality()
 	with attention_tab:
 		render_attention()
-	with retrieval_tab:
-		render_retrieval()
 	with consistency_tab:
 		render_consistency()
+	with retrieval_tab:
+		render_retrieval()
 	with text_tab:
 		render_text_analysis()
 	with visual_tab:
 		render_visual_features()
-	with region_tab:
-		render_region_and_quality()
-	with insights_tab:
-		render_research_insights()
 
 
 if __name__ == "__main__":

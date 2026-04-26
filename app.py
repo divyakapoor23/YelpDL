@@ -352,8 +352,8 @@ def _render_region_impact_callout(ablation: pd.DataFrame, key_prefix: str = "ove
 def render_attention() -> None:
 	st.header("Attention")
 	st.caption(
-		"Cross-modal attention shows how much the model focuses on the image vs the text. "
-		"Comparing without-region and with-region models reveals whether geography shifts modality reliance."
+		"Cross-modal attention shows how the model balances image and text evidence. "
+		"This page focuses on modality share and stability so the comparison answers whether region meaningfully changes that balance."
 	)
 
 	att_no_region = load_csv(OUTPUT_DIR / "attention_Image_plus_Text.csv")
@@ -361,89 +361,193 @@ def render_attention() -> None:
 	att_no_region_summary = load_csv(OUTPUT_DIR / "attention_Image_plus_Text_summary.csv")
 	att_region_summary = load_csv(OUTPUT_DIR / "attention_Image_plus_Text_plus_Region_summary.csv")
 
-	# ── Side-by-side comparison ───────────────────────────────────────────────
-	left, right = st.columns(2)
-
-	def _render_attention_panel(df: pd.DataFrame | None, label: str) -> None:
-		st.markdown(f"**{label}**")
+	def _prepare_attention_frame(df: pd.DataFrame | None, label: str) -> pd.DataFrame | None:
 		if df is None or df.empty:
-			st.info(f"No attention data for {label}.")
-			return
-		c1, c2 = st.columns(2)
-		with c1:
-			metric_card("Mean image α", f"{df['alpha_img'].mean():.4f}")
-		with c2:
-			metric_card("Mean text α", f"{df['alpha_txt'].mean():.4f}")
-		melted = df.melt(var_name="modality", value_name="weight")
-		fig = px.histogram(
-			melted,
-			x="weight",
-			color="modality",
-			barmode="overlay",
-			nbins=40,
-			title=f"Attention Distribution — {label}",
+			return None
+		clean = df[["alpha_img", "alpha_txt"]].apply(pd.to_numeric, errors="coerce").dropna().copy()
+		if clean.empty:
+			return None
+		total_alpha = clean["alpha_img"] + clean["alpha_txt"]
+		clean = clean.loc[total_alpha > 0].copy()
+		if clean.empty:
+			return None
+		total_alpha = clean["alpha_img"] + clean["alpha_txt"]
+		clean["image_share"] = clean["alpha_img"] / total_alpha
+		clean["text_share"] = clean["alpha_txt"] / total_alpha
+		clean["balance_gap"] = clean["text_share"] - clean["image_share"]
+		clean["dominant_modality"] = "Text"
+		clean.loc[clean["image_share"] > clean["text_share"], "dominant_modality"] = "Image"
+		clean["model"] = label
+		return clean
+
+	prepared_frames = [
+		_prepare_attention_frame(att_no_region, "Image + Text"),
+		_prepare_attention_frame(att_region, "Image + Text + Region"),
+	]
+	prepared_frames = [frame for frame in prepared_frames if frame is not None]
+
+	if not prepared_frames:
+		st.info("Run yelp.py first to generate attention outputs.")
+		return
+
+	combined = pd.concat(prepared_frames, ignore_index=True)
+
+	model_summary = (
+		combined.groupby("model", as_index=False)
+		.agg(
+			samples=("model", "size"),
+			mean_alpha_img=("alpha_img", "mean"),
+			mean_alpha_txt=("alpha_txt", "mean"),
+			mean_image_share=("image_share", "mean"),
+			mean_text_share=("text_share", "mean"),
+			text_dominant_rate=("dominant_modality", lambda s: (s == "Text").mean()),
+			median_gap=("balance_gap", "median"),
+			share_std=("text_share", "std"),
 		)
-		st.plotly_chart(fig, use_container_width=True, key=f"attn_hist_{label.replace(' ', '_').replace('+', 'plus')}")
+	)
+	model_summary["share_std"] = model_summary["share_std"].fillna(0.0)
 
-	with left:
-		_render_attention_panel(att_no_region, "Image + Text (no region)")
-	with right:
-		_render_attention_panel(att_region, "Image + Text + Region")
+	st.subheader("What Attention Is Saying")
+	metric_cols = st.columns(len(model_summary))
+	for idx, (_, row) in enumerate(model_summary.iterrows()):
+		with metric_cols[idx]:
+			st.markdown(f"**{row['model']}**")
+			metric_card("Text share", f"{row['mean_text_share']:.1%}")
+			metric_card("Image share", f"{row['mean_image_share']:.1%}")
+			metric_card("Text-dominant samples", f"{row['text_dominant_rate']:.1%}")
 
-	# ── Cross-model delta insight ────────────────────────────────────────────
-	if att_no_region is not None and att_region is not None and not att_no_region.empty and not att_region.empty:
+	share_chart = model_summary.melt(
+		id_vars="model",
+		value_vars=["mean_image_share", "mean_text_share"],
+		var_name="metric",
+		value_name="share",
+	)
+	share_chart["metric"] = share_chart["metric"].map(
+		{"mean_image_share": "Image share", "mean_text_share": "Text share"}
+	)
+	fig_share = px.bar(
+		share_chart,
+		x="model",
+		y="share",
+		color="metric",
+		barmode="group",
+		text="share",
+		title="Normalized Modality Share by Model",
+		labels={"model": "Model", "share": "Average share of attention", "metric": "Modality"},
+	)
+	fig_share.update_traces(texttemplate="%{text:.1%}", textposition="outside")
+	fig_share.update_yaxes(tickformat=".0%", range=[0, 1])
+	st.plotly_chart(fig_share, use_container_width=True, key="attn_share_by_model")
+	st.caption(
+		"These shares are normalized within each sample before averaging, so the chart shows modality balance directly instead of raw alpha magnitudes."
+	)
+
+	dominance_chart = model_summary.melt(
+		id_vars="model",
+		value_vars=["text_dominant_rate"],
+		var_name="metric",
+		value_name="rate",
+	)
+	dominance_chart["metric"] = "Text-dominant samples"
+	fig_dominance = px.bar(
+		dominance_chart,
+		x="model",
+		y="rate",
+		color="metric",
+		text="rate",
+		title="How Often Text Receives More Attention Than Image",
+		labels={"model": "Model", "rate": "Share of samples", "metric": "Finding"},
+	)
+	fig_dominance.update_traces(texttemplate="%{text:.1%}", textposition="outside")
+	fig_dominance.update_yaxes(tickformat=".0%", range=[0, 1])
+	st.plotly_chart(fig_dominance, use_container_width=True, key="attn_dominance_rate")
+
+	spread_chart = combined.melt(
+		id_vars="model",
+		value_vars=["image_share", "text_share"],
+		var_name="metric",
+		value_name="share",
+	)
+	spread_chart["metric"] = spread_chart["metric"].map({"image_share": "Image share", "text_share": "Text share"})
+	fig_spread = px.box(
+		spread_chart,
+		x="metric",
+		y="share",
+		color="model",
+		points=False,
+		title="Sample-to-Sample Stability of Attention Share",
+		labels={"metric": "Modality", "share": "Per-sample normalized share", "model": "Model"},
+	)
+	fig_spread.update_yaxes(tickformat=".0%", range=[0, 1])
+	st.plotly_chart(fig_spread, use_container_width=True, key="attn_share_stability")
+
+	if len(model_summary) == 2:
 		st.divider()
-		st.subheader("How Does Region Shift Modality Attention?")
-		delta_img = att_region["alpha_img"].mean() - att_no_region["alpha_img"].mean()
-		delta_txt = att_region["alpha_txt"].mean() - att_no_region["alpha_txt"].mean()
-		m1, m2 = st.columns(2)
-		with m1:
-			st.metric("Δ Image attention (with − without region)", f"{delta_img:+.4f}")
-		with m2:
-			st.metric("Δ Text attention (with − without region)", f"{delta_txt:+.4f}")
-		if abs(delta_img) > 0.01 or abs(delta_txt) > 0.01:
-			st.info(
-				"Adding region context visibly shifts how the model balances image vs text attention, "
-				"suggesting the geographic signal interacts with visual/textual modality weighting."
+		st.subheader("What Region Changes")
+		base = model_summary.set_index("model")
+		if {"Image + Text", "Image + Text + Region"}.issubset(base.index):
+			shift_df = pd.DataFrame(
+				{
+					"metric": ["Image share", "Text share", "Text-dominant rate", "Raw image α", "Raw text α"],
+					"delta": [
+						base.loc["Image + Text + Region", "mean_image_share"] - base.loc["Image + Text", "mean_image_share"],
+						base.loc["Image + Text + Region", "mean_text_share"] - base.loc["Image + Text", "mean_text_share"],
+						base.loc["Image + Text + Region", "text_dominant_rate"] - base.loc["Image + Text", "text_dominant_rate"],
+						base.loc["Image + Text + Region", "mean_alpha_img"] - base.loc["Image + Text", "mean_alpha_img"],
+						base.loc["Image + Text + Region", "mean_alpha_txt"] - base.loc["Image + Text", "mean_alpha_txt"],
+					],
+				}
 			)
-		else:
-			st.info("Attention balance between modalities is similar with and without region — modality weighting is stable.")
+			fig_shift = px.bar(
+				shift_df,
+				x="metric",
+				y="delta",
+				text="delta",
+				title="Delta After Adding Region (With Region - Without Region)",
+				labels={"metric": "Metric", "delta": "Change"},
+			)
+			fig_shift.update_traces(texttemplate="%{text:.4f}", textposition="outside")
+			st.plotly_chart(fig_shift, use_container_width=True, key="attn_region_shift")
 
-		# Overlay comparison using a single grouped histogram
-		att_no_region["model"] = "No Region"
-		att_region["model"] = "With Region"
-		combined = pd.concat([
-			att_no_region[["alpha_img", "alpha_txt", "model"]],
-			att_region[["alpha_img", "alpha_txt", "model"]],
-		], ignore_index=True)
-		combined_melted = combined.melt(id_vars="model", var_name="modality", value_name="weight")
-		fig = px.histogram(
-			combined_melted,
-			x="weight",
-			color="model",
-			facet_col="modality",
-			barmode="overlay",
-			nbins=40,
-			title="Attention Weight Distribution: With vs Without Region",
-			opacity=0.7,
-		)
-		st.plotly_chart(fig, use_container_width=True, key="attn_combined_histogram")
+			share_delta = abs(float(shift_df.loc[shift_df["metric"] == "Text share", "delta"].iloc[0]))
+			stability_peak = float(model_summary["share_std"].max())
+			if share_delta < 0.01 and stability_peak < 0.01:
+				st.info(
+					"Attention is highly stable across samples and almost unchanged by region. The practical takeaway is that this model relies on text much more than image, and region improves results through other parts of the representation rather than by changing the image-vs-text balance."
+				)
+			else:
+				st.info(
+					"Adding region shifts modality balance enough to be visible here, so region is interacting with how the model weighs image and text evidence."
+				)
 
 	st.divider()
 	st.subheader("Attention Summary Tables")
-	s1, s2 = st.columns(2)
-	with s1:
-		st.markdown("**Image + Text Summary**")
-		if att_no_region_summary is None or att_no_region_summary.empty:
-			st.info("No summary CSV found for Image + Text attention.")
-		else:
-			st.dataframe(att_no_region_summary, use_container_width=True)
-	with s2:
-		st.markdown("**Image + Text + Region Summary**")
-		if att_region_summary is None or att_region_summary.empty:
-			st.info("No summary CSV found for Image + Text + Region attention.")
-		else:
-			st.dataframe(att_region_summary, use_container_width=True)
+	st.dataframe(
+		model_summary.assign(
+			mean_alpha_img=lambda df: df["mean_alpha_img"].map(lambda value: f"{value:.6f}"),
+			mean_alpha_txt=lambda df: df["mean_alpha_txt"].map(lambda value: f"{value:.6f}"),
+			mean_image_share=lambda df: df["mean_image_share"].map(lambda value: f"{value:.2%}"),
+			mean_text_share=lambda df: df["mean_text_share"].map(lambda value: f"{value:.2%}"),
+			text_dominant_rate=lambda df: df["text_dominant_rate"].map(lambda value: f"{value:.2%}"),
+			median_gap=lambda df: df["median_gap"].map(lambda value: f"{value:.2%}"),
+			share_std=lambda df: df["share_std"].map(lambda value: f"{value:.4%}"),
+		),
+		use_container_width=True,
+	)
+	with st.expander("Raw exported summary CSVs"):
+		s1, s2 = st.columns(2)
+		with s1:
+			st.markdown("**Image + Text Summary**")
+			if att_no_region_summary is None or att_no_region_summary.empty:
+				st.info("No summary CSV found for Image + Text attention.")
+			else:
+				st.dataframe(att_no_region_summary, use_container_width=True)
+		with s2:
+			st.markdown("**Image + Text + Region Summary**")
+			if att_region_summary is None or att_region_summary.empty:
+				st.info("No summary CSV found for Image + Text + Region attention.")
+			else:
+				st.dataframe(att_region_summary, use_container_width=True)
 
 
 def render_retrieval() -> None:

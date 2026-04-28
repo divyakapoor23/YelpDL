@@ -1672,16 +1672,11 @@ def main() -> None:
 		"Real-world Streamlit demo for multimodal restaurant sentiment: upload a food image, add review text and region, then turn the prediction into a business insight."
 	)
 
-	landing_tab, prediction_tab, use_cases_tab, explainability_tab, retrieval_tab, text_tab, visual_tab, presentation_tab = st.tabs(
+	landing_tab, prediction_tab, use_cases_tab = st.tabs(
 		[
 			"Landing",
 			"Live Prediction",
 			"Use Cases",
-			"Explainability",
-			"Retrieval",
-			"Text",
-			"Visual",
-			"Presentation Plots",
 		]
 	)
 
@@ -1691,16 +1686,6 @@ def main() -> None:
 		render_live_prediction_demo()
 	with use_cases_tab:
 		render_example_use_cases()
-	with explainability_tab:
-		render_demo_explainability()
-	with retrieval_tab:
-		render_retrieval()
-	with text_tab:
-		render_text_analysis()
-	with visual_tab:
-		render_visual_features()
-	with presentation_tab:
-		render_presentation_plots()
 
 
 if __name__ == "__main__":

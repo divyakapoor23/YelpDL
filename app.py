@@ -760,32 +760,32 @@ def render_presentation_plots() -> None:
 		(
 			"Model F1 Comparison",
 			OUTPUT_DIR / "final_model_f1_bar.png",
-			"Talk track: start with the main result. Point out which model performs best and emphasize whether adding region improves over Image + Text.",
+			"Result: Image + Text + Region is the best model (F1 = 0.9661, Accuracy = 0.9422). Adding region improves over Image + Text (F1: 0.9567 -> 0.9661, +0.0094; Accuracy: 0.9260 -> 0.9422, +0.0162), showing that geographic context provides a measurable performance lift.",
 		),
 		(
 			"Best-Model Confusion Matrix",
 			OUTPUT_DIR / "final_best_model_confusion_matrix.png",
-			"Talk track: explain where the best model is still making mistakes. This helps you discuss false positives vs false negatives instead of only headline accuracy.",
+			"Result: The best model still makes more false negatives than false positives, consistent with Recall (0.9560) being lower than Precision (0.9765). In practice, it is slightly more conservative when predicting positive sentiment, which keeps false alarms low but misses some true positives.",
 		),
 		(
 			"Perception Gap by Region",
 			OUTPUT_DIR / "final_perception_gap_by_region.png",
-			"Talk track: use this to argue that sentiment is not uniform across locations. Some regions show much larger disagreement between image and text perception.",
+			"Result: Perception gap is clearly location-dependent, with mismatch rates ranging from 21.43% to 44.83% across regions in this run. High-gap regions (for example, St Petersburg_FL at 44.83%) indicate much stronger image-text disagreement than lower-gap regions, supporting the value of geographic context.",
 		),
 		(
 			"Perception Gap by Cuisine",
 			OUTPUT_DIR / "final_perception_gap_by_cuisine.png",
-			"Talk track: highlight that the perception gap also depends on cuisine type, which suggests some food categories are visually or textually easier to judge than others.",
+			"Result: Perception gap also varies strongly by cuisine, with mismatch rates ranging from 15.15% (Jazz & Blues) to 50.72% (Italian) in this run. This indicates some cuisine categories are substantially harder for image and text signals to agree on than others.",
 		),
 		(
 			"Attention Comparison",
 			OUTPUT_DIR / "final_attention_comparison.png",
-			"Talk track: explain how the model balances image vs text information. Use this figure to describe whether region changes modality reliance.",
+			"Result: Adding region shifts modality reliance toward image features: image concentration rises from 0.2224 to 0.4177 (+0.1953), while text concentration decreases slightly from 0.1767 to 0.1655 (-0.0112). This shift is accompanied by higher accuracy (0.9260 to 0.9422), suggesting region-aware fusion helps the model use visual evidence more effectively.",
 		),
 		(
 			"Region/Cuisine Spread",
 			OUTPUT_DIR / "final_region_cuisine_spread.png",
-			"Talk track: close by showing that the same cuisine can receive different sentiment across regions, which is your strongest justification for region-aware modeling.",
+			"Result: The same cuisine shows large regional sentiment variability. For example, Seafood has the widest spread (min 0.35, max 0.94; spread 0.59 across 7 regions), and even broad categories like Restaurants vary from 0.7143 to 1.0000 across 21 regions. This directly supports region-aware modeling.",
 		),
 	]
 

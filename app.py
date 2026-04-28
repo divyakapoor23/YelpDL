@@ -1,4 +1,5 @@
 from pathlib import Path
+import io
 import os
 import re
 import subprocess
@@ -528,7 +529,15 @@ def _load_checkpoint_inference_bundle() -> dict[str, object]:
 		import yelp as yelp_module
 		from torchvision import transforms
 	except Exception as exc:
-		return {"error": f"Unable to import the model runtime: {exc}"}
+		return {
+			"error": (
+				f"Unable to import the model runtime: {exc}\n\n"
+				f"Python interpreter: {sys.executable}\n"
+				"Install missing deps in this same environment, e.g.:\n"
+				"python -m pip install torch torchvision\n"
+				"Then restart Streamlit."
+			)
+		}
 
 	checkpoint_path = OUTPUT_DIR / "best_Image_plus_Text_plus_Region.pt"
 	if not checkpoint_path.exists():
@@ -610,6 +619,18 @@ def _resolve_demo_image(uploaded_image, sample_image_path: str | None, use_sampl
 		return Image.open(sample_image_path).convert("RGB"), "Sample dataset image"
 	return None, None
 
+
+
+def _get_image_from_session_or_sample(image_bytes, sample_image_path: str | None, use_sample: bool):
+	"""Return a file-like image object from session bytes or the sample image path."""
+	if image_bytes:
+		return io.BytesIO(image_bytes)
+
+	if use_sample and sample_image_path:
+		with open(sample_image_path, "rb") as file:
+			return io.BytesIO(file.read())
+
+	return None
 
 def _analyze_text_signal(review_text: str) -> dict[str, object]:
 	tokens = re.findall(r"[a-z']+", review_text.lower())
@@ -837,8 +858,131 @@ def _estimate_demo_prediction(
 	}
 
 
+@st.cache_resource(show_spinner=False)
+def _load_multimodel_inference_bundle() -> dict[str, object]:
+	base_bundle = _load_checkpoint_inference_bundle()
+	if "error" in base_bundle:
+		return base_bundle
+
+	torch = base_bundle["torch"]
+	yelp_module = base_bundle["yelp_module"]
+	device = base_bundle["device"]
+
+	checkpoint_map = {
+		"Image Only": OUTPUT_DIR / "best_Image_Only.pt",
+		"Text Only": OUTPUT_DIR / "best_Text_Only.pt",
+		"Image + Text": OUTPUT_DIR / "best_Image_plus_Text.pt",
+	}
+
+	try:
+		for label, path in checkpoint_map.items():
+			if not path.exists():
+				return {"error": f"Missing checkpoint for {label}: {path}"}
+
+		image_model = yelp_module.ImageOnlyModel(use_pretrained=False)
+		image_model.load_state_dict(torch.load(checkpoint_map["Image Only"], map_location=device))
+		image_model = image_model.to(device)
+		image_model.eval()
+
+		text_model = yelp_module.TextOnlyModel(yelp_module.VOCAB_SIZE, yelp_module.EMBED_DIM, yelp_module.LSTM_HIDDEN)
+		text_model.load_state_dict(torch.load(checkpoint_map["Text Only"], map_location=device))
+		text_model = text_model.to(device)
+		text_model.eval()
+
+		image_text_model = yelp_module.ImageTextFusionModel(yelp_module.VOCAB_SIZE, use_pretrained=False)
+		image_text_model.load_state_dict(torch.load(checkpoint_map["Image + Text"], map_location=device))
+		image_text_model = image_text_model.to(device)
+		image_text_model.eval()
+	except Exception as exc:
+		return {"error": f"Unable to load ablation checkpoints: {exc}"}
+
+	return {
+		**base_bundle,
+		"image_model": image_model,
+		"text_model": text_model,
+		"image_text_model": image_text_model,
+		"full_model": base_bundle["model"],
+	}
+
+
+def _run_multimodal_comparison(
+	review_text: str,
+	uploaded_image,
+	region: str,
+	cuisine: str,
+	sample_image_path: str | None,
+	use_sample_image: bool,
+) -> dict[str, object]:
+	bundle = _load_multimodel_inference_bundle()
+	if "error" in bundle:
+		raise RuntimeError(str(bundle["error"]))
+
+	torch = bundle["torch"]
+	yelp_module = bundle["yelp_module"]
+	device = bundle["device"]
+	tokenizer = bundle["tokenizer"]
+	image_transform = bundle["image_transform"]
+	region_to_id = bundle["region_to_id"]
+	unknown_region_id = bundle["unknown_region_id"]
+	category_to_id = bundle["category_to_id"]
+	unknown_category_id = bundle["unknown_category_id"]
+	id_to_category = bundle["id_to_category"]
+
+	image_model = bundle["image_model"]
+	text_model = bundle["text_model"]
+	image_text_model = bundle["image_text_model"]
+	full_model = bundle["full_model"]
+
+	pil_image, image_source = _resolve_demo_image(uploaded_image, sample_image_path, use_sample_image)
+	if pil_image is None:
+		raise RuntimeError("Please upload a food image or enable the sample dataset image.")
+
+	image_tensor = image_transform(pil_image).unsqueeze(0).to(device)
+	text_seq = yelp_module.encode_texts(tokenizer, [review_text], max_len=yelp_module.MAX_TEXT_LEN)
+	text_tensor = torch.tensor(text_seq, dtype=torch.long, device=device)
+	region_tensor = torch.tensor([region_to_id.get(region, unknown_region_id)], dtype=torch.long, device=device)
+	category_tensor = torch.tensor([category_to_id.get(cuisine, unknown_category_id)], dtype=torch.long, device=device)
+
+	with torch.no_grad():
+		image_prob = float(torch.sigmoid(image_model(image_tensor)).item())
+		text_prob = float(torch.sigmoid(text_model(text_tensor)).item())
+		image_text_prob = float(torch.sigmoid(image_text_model(image_tensor, text_tensor)).item())
+		full_sentiment_logits, full_category_logits, full_rating_pred = full_model(
+			image_tensor,
+			text_tensor,
+			region_tensor,
+			category_tensor,
+		)
+		full_prob = float(torch.sigmoid(full_sentiment_logits).item())
+		full_rating = float(full_rating_pred.item())
+		predicted_category_id = int(torch.argmax(full_category_logits, dim=1).item())
+
+	def to_row(model_name: str, positive_prob: float) -> dict[str, object]:
+		label = "Positive" if positive_prob >= 0.5 else "Negative"
+		confidence = max(positive_prob, 1.0 - positive_prob)
+		return {
+			"Model": model_name,
+			"Prediction": label,
+			"Confidence": confidence,
+		}
+
+	comparison_rows = [
+		to_row("Image Only", image_prob),
+		to_row("Text Only", text_prob),
+		to_row("Image + Text", image_text_prob),
+		to_row("Image + Text + Region", full_prob),
+	]
+
+	return {
+		"rows": comparison_rows,
+		"predicted_rating": full_rating,
+		"predicted_category": id_to_category.get(predicted_category_id, "<unknown_category>"),
+		"image_source": image_source,
+	}
+
+
 def render_live_prediction_demo() -> None:
-	st.header("Live Prediction")
+	st.header("Food Sentiment Predictor Demo")
 	st.caption("Upload a food image, add review text, choose region and cuisine, then walk through the same real-world demo flow you would use in a presentation.")
 
 	reference_data = _get_demo_reference_data()
@@ -914,10 +1058,10 @@ def render_live_prediction_demo() -> None:
 		with m2:
 			st.metric("Confidence", f"{float(result['confidence']):.0%}")
 		with m3:
-			st.metric("Text focus", f"{float(result['text_focus']):.0%}")
+			st.metric("Predicted rating estimate", f"{float(result['predicted_rating']):.2f}")
 		with m4:
-			st.metric("Image focus", f"{float(result['image_focus']):.0%}")
-		st.caption(f"Inference source: {result['image_source']} | Predicted category proxy: {result['predicted_category']} | Predicted rating proxy: {float(result['predicted_rating']):.2f}")
+			st.metric("Predicted cuisine/category", str(result["predicted_category"]))
+		st.caption(f"Inference source: {result['image_source']}")
 
 		probability_df = pd.DataFrame(
 			{
@@ -960,6 +1104,7 @@ def render_live_prediction_demo() -> None:
 			st.plotly_chart(fig, width="stretch", key="demo_focus_bar")
 
 		st.markdown("### Step 3: Show explanation")
+		st.info("The model used image + review text + region context.")
 		st.info(result["attention_explanation"])
 		explain_left, explain_right = st.columns(2)
 		with explain_left:
@@ -985,6 +1130,228 @@ def render_live_prediction_demo() -> None:
 			st.success(result["region_insight"])
 		with insight_right:
 			st.warning(result["business_insight"])
+
+
+def render_multimodal_comparison_demo() -> None:
+	st.header("Multimodal Comparison Demo")
+	st.caption("Compare all four ablation variants side by side on the same user input.")
+
+	reference_data = _get_demo_reference_data()
+	regions = _get_demo_regions(reference_data)
+	cuisines = _get_demo_cuisines(reference_data)
+	sample_image_path = _load_sample_demo_image(reference_data)
+
+	if "comparison_review_text" not in st.session_state:
+		st.session_state["comparison_review_text"] = DEMO_SCENARIOS["Perception gap demo - Nashville"]["review"]
+	if "comparison_region" not in st.session_state:
+		st.session_state["comparison_region"] = DEMO_SCENARIOS["Perception gap demo - Nashville"]["region"]
+	if "comparison_cuisine" not in st.session_state:
+		st.session_state["comparison_cuisine"] = DEMO_SCENARIOS["Perception gap demo - Nashville"]["cuisine"]
+
+	left, right = st.columns((1.1, 0.9))
+	with left:
+		with st.form("multimodal_comparison_form"):
+			uploaded_image = st.file_uploader("Food image", type=["png", "jpg", "jpeg"], key="comparison_uploader")
+			use_sample_image = st.checkbox("Use sample dataset image when no upload is provided", value=bool(sample_image_path), key="comparison_use_sample")
+			review_text = st.text_area("Review text", key="comparison_review_text", height=140)
+			region = st.selectbox("Region / city", regions, key="comparison_region")
+			cuisine = st.selectbox("Cuisine", cuisines, key="comparison_cuisine")
+			run_compare = st.form_submit_button("Run multimodal comparison", width="stretch")
+
+	with right:
+		st.markdown("**Expected comparison view**")
+		st.markdown("- Image-only model")
+		st.markdown("- Text-only model")
+		st.markdown("- Image + Text model")
+		st.markdown("- Image + Text + Region model")
+		st.caption("This directly matches your ablation research question.")
+
+	if run_compare:
+		with st.spinner("Running all four checkpoints..."):
+			try:
+				comparison = _run_multimodal_comparison(
+					review_text=review_text,
+					uploaded_image=uploaded_image,
+					region=region,
+					cuisine=cuisine,
+					sample_image_path=sample_image_path,
+					use_sample_image=use_sample_image,
+				)
+			except RuntimeError as exc:
+				st.error(str(exc))
+				return
+
+		comparison_df = pd.DataFrame(comparison["rows"])
+		comparison_df["Confidence"] = comparison_df["Confidence"].map(lambda value: f"{value:.0%}")
+		st.dataframe(comparison_df, width="stretch")
+		st.caption(
+			f"Image source: {comparison['image_source']} | Predicted rating estimate: {comparison['predicted_rating']:.2f} | "
+			f"Predicted cuisine/category: {comparison['predicted_category']}"
+		)
+
+
+def render_region_impact_demo() -> None:
+	st.header("Region Impact Demo")
+	st.caption("Explore how sentiment changes by location and why region context improves model behavior.")
+
+	reference_data = _get_demo_reference_data()
+	regions_df = reference_data.get("region_stats")
+	cuisine_spread_df = reference_data.get("cuisine_spread")
+	mismatch_df = reference_data.get("mismatch")
+	ablation_df = load_csv(OUTPUT_DIR / "ablation_results.csv")
+
+	cuisines = _get_demo_cuisines(reference_data)
+	regions = _get_demo_regions(reference_data)
+	selected_cuisine = st.selectbox("Cuisine", cuisines, key="region_impact_cuisine")
+	selected_region = st.selectbox("Region", regions, key="region_impact_region")
+
+	metric_col1, metric_col2, metric_col3 = st.columns(3)
+	with metric_col1:
+		if regions_df is not None and not regions_df.empty and {"region", "positive_rate"}.issubset(regions_df.columns):
+			region_row = regions_df[regions_df["region"] == selected_region]
+			if not region_row.empty:
+				st.metric("Positive sentiment rate (selected region)", f"{float(region_row.iloc[0]['positive_rate']):.1%}")
+			else:
+				st.metric("Positive sentiment rate (selected region)", "N/A")
+		else:
+			st.metric("Positive sentiment rate (selected region)", "N/A")
+
+	with metric_col2:
+		if cuisine_spread_df is not None and not cuisine_spread_df.empty:
+			match = cuisine_spread_df[cuisine_spread_df["cuisine_cluster"] == selected_cuisine]
+			if not match.empty:
+				st.metric("Region sentiment spread", f"{float(match.iloc[0]['spread']):.2f}")
+			else:
+				st.metric("Region sentiment spread", "N/A")
+		else:
+			st.metric("Region sentiment spread", "N/A")
+
+	with metric_col3:
+		if ablation_df is not None and not ablation_df.empty and {"Model", "F1"}.issubset(ablation_df.columns):
+			ablation = _coerce_numeric_columns(ablation_df, ["F1"])
+			row_it = ablation[ablation["Model"] == "Image + Text"]
+			row_full = ablation[ablation["Model"] == "Image + Text + Region"]
+			if not row_it.empty and not row_full.empty:
+				delta = float(row_full.iloc[0]["F1"] - row_it.iloc[0]["F1"])
+				st.metric("Region impact on F1", f"{delta:+.4f}")
+			else:
+				st.metric("Region impact on F1", "N/A")
+		else:
+			st.metric("Region impact on F1", "N/A")
+
+	left, right = st.columns(2)
+	with left:
+		if regions_df is not None and not regions_df.empty and {"region", "positive_rate"}.issubset(regions_df.columns):
+			region_chart_df = _coerce_numeric_columns(regions_df, ["positive_rate", "total"])
+			fig = px.bar(
+				region_chart_df.sort_values("positive_rate", ascending=False).head(15),
+				x="region",
+				y="positive_rate",
+				color="positive_rate",
+				text="positive_rate",
+				title="Positive sentiment rate by region",
+			)
+			fig.update_traces(texttemplate="%{text:.1%}", textposition="outside")
+			fig.update_yaxes(tickformat=".0%")
+			st.plotly_chart(fig, width="stretch", key="region_impact_positive_rate")
+		else:
+			st.info("Region sentiment stats are unavailable.")
+
+	with right:
+		if mismatch_df is not None and not mismatch_df.empty and {"cuisine", "region", "text_prob"}.issubset(mismatch_df.columns):
+			cuisine_slice = mismatch_df[mismatch_df["cuisine"] == selected_cuisine].copy()
+			if not cuisine_slice.empty:
+				cuisine_slice = _coerce_numeric_columns(cuisine_slice, ["text_prob"])
+				top_regions = (
+					cuisine_slice.groupby("region", as_index=False)["text_prob"].mean()
+					.sort_values("text_prob", ascending=False)
+					.head(10)
+				)
+				fig = px.bar(
+					top_regions,
+					x="region",
+					y="text_prob",
+					color="text_prob",
+					text="text_prob",
+					title=f"Top regions for {selected_cuisine} (text sentiment proxy)",
+				)
+				fig.update_traces(texttemplate="%{text:.1%}", textposition="outside")
+				fig.update_yaxes(tickformat=".0%")
+				st.plotly_chart(fig, width="stretch", key="region_impact_top_cuisine_regions")
+			else:
+				st.info(f"No region-level rows available for cuisine '{selected_cuisine}'.")
+		else:
+			st.info("Cuisine-region sentiment rows are unavailable.")
+
+
+def render_perception_gap_explorer() -> None:
+	st.header("Perception Gap Explorer")
+	st.caption("Inspect cases where image and text sentiment disagree, especially image-positive vs text-negative mismatches.")
+
+	mismatch_df = load_csv(OUTPUT_DIR / "image_text_consistency_predictions.csv")
+	if mismatch_df is None or mismatch_df.empty:
+		st.info("No perception-gap outputs found. Run yelp.py to generate image-text consistency files.")
+		return
+
+	mismatch_df = _coerce_numeric_columns(
+		mismatch_df,
+		["image_prob", "text_prob", "mismatch", "img_pos_txt_neg", "img_neg_txt_pos"],
+	)
+
+	mode = st.radio(
+		"Gap mode",
+		["Image positive / Text negative", "Image negative / Text positive", "All mismatches"],
+		horizontal=True,
+	)
+	regions = ["All"] + sorted(mismatch_df["region"].dropna().astype(str).unique().tolist())
+	cuisines = ["All"] + sorted(mismatch_df["cuisine"].dropna().astype(str).unique().tolist())
+	selected_region = st.selectbox("Region filter", regions, key="gap_region_filter")
+	selected_cuisine = st.selectbox("Cuisine filter", cuisines, key="gap_cuisine_filter")
+
+	filtered = mismatch_df.copy()
+	if mode == "Image positive / Text negative":
+		filtered = filtered[filtered["img_pos_txt_neg"] == 1]
+	elif mode == "Image negative / Text positive":
+		filtered = filtered[filtered["img_neg_txt_pos"] == 1]
+	else:
+		filtered = filtered[filtered["mismatch"] == 1]
+
+	if selected_region != "All":
+		filtered = filtered[filtered["region"] == selected_region]
+	if selected_cuisine != "All":
+		filtered = filtered[filtered["cuisine"] == selected_cuisine]
+
+	left, right = st.columns(2)
+	with left:
+		st.metric("Filtered mismatch cases", f"{len(filtered):,}")
+	with right:
+		if len(mismatch_df) > 0:
+			st.metric("Overall mismatch rate", f"{float(mismatch_df['mismatch'].mean()):.1%}")
+
+	if filtered.empty:
+		st.warning("No rows match the selected filters.")
+		return
+
+	scatter_df = filtered.head(800)
+	fig = px.scatter(
+		scatter_df,
+		x="image_prob",
+		y="text_prob",
+		color="region",
+		hover_data=["cuisine", "label"],
+		title="Perception gap cases (image probability vs text probability)",
+	)
+	fig.add_hline(y=0.5, line_dash="dot")
+	fig.add_vline(x=0.5, line_dash="dot")
+	st.plotly_chart(fig, width="stretch", key="gap_scatter")
+
+	st.markdown("**Examples**")
+	st.dataframe(
+		filtered[["region", "cuisine", "label", "image_prob", "text_prob", "image_pred", "text_pred"]].head(120),
+		width="stretch",
+	)
+
+	st.info("Perception gap means the image looks appealing but the review tone is negative (or vice versa), which is exactly where multimodal reasoning matters.")
 
 
 def render_example_use_cases() -> None:
@@ -1263,7 +1630,7 @@ def sidebar_controls() -> None:
 
 
 def render_retrieval() -> None:
-	st.header("Cross-Modal Retrieval")
+	st.header("Cross-Modal Retrieval Demo")
 	text_to_image = load_csv(OUTPUT_DIR / "retrieval_text_to_image.csv")
 	image_to_text = load_csv(OUTPUT_DIR / "retrieval_image_to_text.csv")
 
@@ -1663,29 +2030,622 @@ def _render_noise_analysis(noise_df: pd.DataFrame | None) -> None:
 
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# SECTION 1 — Home
+# ──────────────────────────────────────────────────────────────────────────────
+
+def render_home() -> None:
+	ablation_df = load_csv(OUTPUT_DIR / "ablation_results.csv")
+
+	st.markdown(
+		"""
+		<div class="yfi-hero">
+			<div class="yfi-section-label">Indiana University — Multimodal Sentiment Demo</div>
+			<h1>Yelp Food Intelligence</h1>
+			<p>
+				Can a model look at a food photo, read a Yelp review, and factor in the local market
+				to accurately predict whether the dining experience was positive or negative?
+				This demo answers that question with four checkpointed models, real Yelp data, and transparent explanations.
+			</p>
+			<div class="yfi-badge-row">
+				<div class="yfi-badge">Checkpoint-only inference — no training in demo</div>
+				<div class="yfi-badge">4 ablation variants</div>
+				<div class="yfi-badge">Region-aware fusion</div>
+				<div class="yfi-badge">Perception gap analysis</div>
+			</div>
+		</div>
+		""",
+		unsafe_allow_html=True,
+	)
+
+	st.markdown("### What problem does this solve?")
+	p1, p2, p3 = st.columns(3)
+	with p1:
+		st.markdown(
+			"""
+			<div class="yfi-panel">
+				<h3>The gap problem</h3>
+				<p>A dish can look beautiful in a photo but generate negative reviews.
+				A text-only or image-only model misses this disconnect. Multimodal fusion catches it.</p>
+			</div>
+			""",
+			unsafe_allow_html=True,
+		)
+	with p2:
+		st.markdown(
+			"""
+			<div class="yfi-panel">
+				<h3>The region problem</h3>
+				<p>Customer expectations differ by city and cuisine.
+				A seafood dish in Tampa has different local benchmarks than the same dish in Philadelphia.
+				Geographic context improves predictions.</p>
+			</div>
+			""",
+			unsafe_allow_html=True,
+		)
+	with p3:
+		st.markdown(
+			"""
+			<div class="yfi-panel">
+				<h3>The explainability problem</h3>
+				<p>A black-box score is not actionable. This system shows whether the model
+				leaned on image evidence or text evidence, turning a prediction into a specific
+				operational recommendation.</p>
+			</div>
+			""",
+			unsafe_allow_html=True,
+		)
+
+	st.markdown("### Research question")
+	st.info(RESEARCH_QUESTION)
+
+	st.markdown("### Model variants (inference only — checkpoints pre-trained)")
+	model_rows = [
+		{"Variant": "Image Only", "Inputs": "Food photo (ResNet18 CNN)", "Checkpoint": "best_Image_Only.pt"},
+		{"Variant": "Text Only", "Inputs": "Review text (LSTM)", "Checkpoint": "best_Text_Only.pt"},
+		{"Variant": "Image + Text", "Inputs": "Photo + review (CNN + LSTM fusion)", "Checkpoint": "best_Image_plus_Text.pt"},
+		{"Variant": "Image + Text + Region", "Inputs": "Photo + review + city/cuisine context", "Checkpoint": "best_Image_plus_Text_plus_Region.pt"},
+	]
+	st.dataframe(pd.DataFrame(model_rows), hide_index=True, use_container_width=True)
+
+	if ablation_df is not None and not ablation_df.empty and {"Model", "F1", "Accuracy"}.issubset(ablation_df.columns):
+		ablation = _coerce_numeric_columns(ablation_df, ["F1", "Accuracy", "Precision", "Recall"])
+		best_row = ablation.sort_values("F1", ascending=False).iloc[0]
+		m1, m2, m3 = st.columns(3)
+		with m1:
+			st.metric("Best model", str(best_row["Model"]))
+		with m2:
+			st.metric("Best F1", f"{float(best_row['F1']):.4f}")
+		with m3:
+			st.metric("Best accuracy", f"{float(best_row['Accuracy']):.4f}")
+
+	st.markdown("### Demo flow — use the tabs above in order")
+	steps = [
+		("Upload & Review", "Upload a food photo and type (or paste) a Yelp review. Choose region and cuisine."),
+		("Predict Sentiment", "Run the full Image + Text + Region model. See label, confidence, and explanation."),
+		("Compare Models", "Run all four variants on your input to see the effect of each modality."),
+		("Region & Cuisine", "Explore how sentiment varies by city and cuisine across the dataset."),
+		("Perception Gaps", "Browse cases where image and text sentiment disagree."),
+		("Results & Limitations", "Full ablation table, key findings, and honest limitations."),
+	]
+	for i, (tab_name, description) in enumerate(steps, 1):
+		st.markdown(f"**{i}. {tab_name}** — {description}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SECTION 2 — Upload & Review
+# ──────────────────────────────────────────────────────────────────────────────
+
+def render_upload_review() -> None:
+	reference_data = _get_demo_reference_data()
+	regions = _get_demo_regions(reference_data)
+	cuisines = _get_demo_cuisines(reference_data)
+	sample_image_path = _load_sample_demo_image(reference_data)
+
+	st.header("Upload Food Image & Enter Review")
+	st.caption(
+		"Provide a food photo and a Yelp-style review. "
+		"Your inputs are saved to session state and shared with the Predict and Compare tabs."
+	)
+
+	# ── defaults ──────────────────────────────────────────────────────────────
+	if "input_review_text" not in st.session_state:
+		st.session_state["input_review_text"] = DEMO_SCENARIOS["Perception gap demo - Nashville"]["review"]
+	if "input_region" not in st.session_state:
+		st.session_state["input_region"] = DEMO_SCENARIOS["Perception gap demo - Nashville"]["region"]
+	if "input_cuisine" not in st.session_state:
+		st.session_state["input_cuisine"] = DEMO_SCENARIOS["Perception gap demo - Nashville"]["cuisine"]
+
+	# ── scenario loader ───────────────────────────────────────────────────────
+	scol1, scol2 = st.columns([3, 1])
+	with scol1:
+		scenario_name = st.selectbox(
+			"Quick-load a scenario", list(DEMO_SCENARIOS.keys()), index=1, key="upload_scenario_select"
+		)
+	with scol2:
+		st.markdown("<br>", unsafe_allow_html=True)
+		if st.button("Load scenario", key="upload_load_scenario"):
+			scenario = DEMO_SCENARIOS[scenario_name]
+			st.session_state["input_review_text"] = scenario["review"]
+			st.session_state["input_region"] = scenario["region"]
+			st.session_state["input_cuisine"] = scenario["cuisine"]
+			st.rerun()
+
+	col1, col2 = st.columns((1.15, 0.85))
+	with col1:
+		uploaded_image = st.file_uploader(
+			"Food image (optional — sample image used when none uploaded)",
+			type=["png", "jpg", "jpeg"],
+			key="input_uploader",
+		)
+		use_sample = st.checkbox(
+			"Use sample dataset image when no upload is provided",
+			value=st.session_state.get("input_use_sample", bool(sample_image_path)),
+			key="input_use_sample",
+		)
+
+		# Immediately persist bytes so they survive tab switches
+		if uploaded_image is not None:
+			uploaded_image.seek(0)
+			st.session_state["input_image_bytes"] = uploaded_image.read()
+			st.session_state["input_image_name"] = uploaded_image.name
+
+		review_text = st.text_area(
+			"Yelp review text",
+			key="input_review_text",
+			height=150,
+			placeholder="Paste or type a food review here…",
+		)
+
+		default_region_idx = regions.index(st.session_state["input_region"]) if st.session_state["input_region"] in regions else 0
+		st.selectbox("Region / city", regions, index=default_region_idx, key="input_region")
+
+		default_cuisine_idx = cuisines.index(st.session_state["input_cuisine"]) if st.session_state["input_cuisine"] in cuisines else 0
+		st.selectbox("Cuisine", cuisines, index=default_cuisine_idx, key="input_cuisine")
+
+		st.caption(DEMO_SCENARIOS.get(scenario_name, {}).get("insight", ""))
+
+	with col2:
+		st.markdown("### Input preview")
+		image_bytes = st.session_state.get("input_image_bytes")
+		if image_bytes:
+			st.image(image_bytes, caption="Saved food image", use_container_width=True)
+		elif use_sample and sample_image_path:
+			st.image(sample_image_path, caption="Sample dataset image", use_container_width=True)
+		else:
+			st.info("Upload a food photo or enable the sample image.")
+
+		saved_review = st.session_state.get("input_review_text", "")
+		if saved_review:
+			st.markdown("**Review snippet:**")
+			snippet = saved_review[:160] + ("…" if len(saved_review) > 160 else "")
+			st.caption(snippet)
+
+		st.markdown(f"**Region:** {st.session_state.get('input_region', '—')}")
+		st.markdown(f"**Cuisine:** {st.session_state.get('input_cuisine', '—')}")
+
+	st.success(
+		"Inputs are saved automatically. "
+		"Switch to **Predict Sentiment** to run the model, or **Compare Models** to see all four variants."
+	)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SECTION 3 — Predict Sentiment
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _display_prediction_result(result: dict) -> None:
+	"""Render the full prediction result card (metrics, charts, explanation, insights)."""
+	st.markdown("### Prediction result")
+	m1, m2, m3, m4 = st.columns(4)
+	with m1:
+		st.metric("Sentiment", result["label"])
+	with m2:
+		st.metric("Confidence", f"{float(result['confidence']):.0%}")
+	with m3:
+		st.metric("Predicted rating", f"{float(result['predicted_rating']):.2f}")
+	with m4:
+		st.metric("Category prediction", str(result["predicted_category"]))
+	st.caption(f"Inference source: {result['image_source']}")
+
+	probability_df = pd.DataFrame({
+		"Sentiment": ["Positive", "Negative"],
+		"Probability": [float(result["positive_probability"]), float(result["negative_probability"])],
+	})
+	focus_df = pd.DataFrame({
+		"Signal": ["Text", "Image"],
+		"Focus": [float(result["text_focus"]), float(result["image_focus"])],
+	})
+
+	left, right = st.columns(2)
+	with left:
+		fig = px.bar(
+			probability_df,
+			x="Sentiment",
+			y="Probability",
+			color="Sentiment",
+			text="Probability",
+			title="Sentiment probabilities",
+		)
+		fig.update_traces(texttemplate="%{text:.0%}", textposition="outside")
+		fig.update_yaxes(tickformat=".0%", range=[0, 1])
+		fig.update_layout(showlegend=False)
+		st.plotly_chart(fig, use_container_width=True, key="predict_prob_bar")
+	with right:
+		fig = px.bar(
+			focus_df,
+			x="Signal",
+			y="Focus",
+			color="Signal",
+			text="Focus",
+			title="Attention — which signal drove the decision?",
+		)
+		fig.update_traces(texttemplate="%{text:.0%}", textposition="outside")
+		fig.update_yaxes(tickformat=".0%", range=[0, 1])
+		fig.update_layout(showlegend=False)
+		st.plotly_chart(fig, use_container_width=True, key="predict_focus_bar")
+
+	st.markdown("### Explanation")
+	st.info(result["attention_explanation"])
+
+	explain_left, explain_right = st.columns(2)
+	with explain_left:
+		st.markdown("**Text signal**")
+		st.write(result["text_result"]["summary"])
+		positive_hits = result["text_result"]["positive_hits"]
+		negative_hits = result["text_result"]["negative_hits"]
+		st.caption(
+			"Positive cues: " + (", ".join(positive_hits) if positive_hits else "none") +
+			" | Negative cues: " + (", ".join(negative_hits) if negative_hits else "none")
+		)
+	with explain_right:
+		st.markdown("**Visual signal**")
+		st.write(result["image_result"]["summary"])
+		if result["image_result"].get("brightness") is not None:
+			st.caption(
+				f"Brightness {float(result['image_result']['brightness']):.0%} | "
+				f"Contrast {float(result['image_result']['contrast']):.0%} | "
+				f"Warmth {float(result['image_result']['warmth']):.0%}"
+			)
+
+	st.markdown("### Business insight")
+	bi_left, bi_right = st.columns(2)
+	with bi_left:
+		st.success(result["region_insight"])
+	with bi_right:
+		st.warning(result["business_insight"])
+
+
+def render_predict_sentiment() -> None:
+	reference_data = _get_demo_reference_data()
+	sample_image_path = _load_sample_demo_image(reference_data)
+
+	st.header("Predict Sentiment")
+	st.caption(
+		"Runs the full Image + Text + Region checkpoint on your saved inputs and "
+		"explains what drove the decision — image attention or text attention."
+	)
+
+	review_text = st.session_state.get("input_review_text", "")
+	region = st.session_state.get("input_region", "Nashville_TN")
+	cuisine = st.session_state.get("input_cuisine", "American (New)")
+	use_sample = st.session_state.get("input_use_sample", True)
+	image_bytes = st.session_state.get("input_image_bytes")
+
+	# ── current inputs summary ─────────────────────────────────────────────
+	st.markdown("**Current inputs (from Upload & Review tab):**")
+	inp1, inp2, inp3 = st.columns(3)
+	with inp1:
+		st.markdown(f"**Region:** {region}  \n**Cuisine:** {cuisine}")
+	with inp2:
+		if review_text:
+			snippet = review_text[:130] + ("…" if len(review_text) > 130 else "")
+			st.caption(snippet)
+		else:
+			st.caption("No review text saved.")
+	with inp3:
+		if image_bytes:
+			st.image(image_bytes, width=140, caption="Input image")
+		elif use_sample and sample_image_path:
+			st.image(sample_image_path, width=140, caption="Sample image")
+		else:
+			st.caption("No image.")
+
+	st.caption("To change inputs, switch to the Upload & Review tab.")
+
+	if not review_text:
+		st.warning("No review text found. Go to the **Upload & Review** tab and enter a review first.")
+		return
+
+	if not image_bytes and not (use_sample and sample_image_path):
+		st.warning("No image available. Go to the **Upload & Review** tab and upload an image or enable the sample image.")
+		return
+
+	run_pred = st.button("Run sentiment prediction", type="primary", key="run_predict_btn")
+
+	# Persist and show last result
+	if not run_pred and "last_prediction_result" in st.session_state:
+		st.divider()
+		st.caption("Showing last prediction result. Click the button above to re-run.")
+		_display_prediction_result(st.session_state["last_prediction_result"])
+		return
+
+	if run_pred:
+		image_file = _get_image_from_session_or_sample(
+			image_bytes=image_bytes,
+			sample_image_path=sample_image_path,
+			use_sample=use_sample,
+		)
+		with st.spinner("Running checkpoint inference…"):
+			try:
+				result = _estimate_demo_prediction(
+					review_text, image_file, region, cuisine,
+					reference_data, sample_image_path, use_sample,
+				)
+			except RuntimeError as exc:
+				st.error(str(exc))
+				return
+		st.session_state["last_prediction_result"] = result
+		st.divider()
+		_display_prediction_result(result)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SECTION 4 — Compare Models
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _display_comparison_result(comparison: dict) -> None:
+	"""Render the 4-model comparison table and bar chart."""
+	comparison_df = pd.DataFrame(comparison["rows"])
+	comparison_df["Confidence %"] = comparison_df["Confidence"].map(lambda v: f"{v:.0%}")
+	st.markdown("### Comparison table")
+	st.dataframe(
+		comparison_df[["Model", "Prediction", "Confidence %"]],
+		hide_index=True,
+		use_container_width=True,
+	)
+
+	fig = px.bar(
+		pd.DataFrame(comparison["rows"]),
+		x="Model",
+		y="Confidence",
+		color="Prediction",
+		text="Confidence",
+		title="Confidence by model variant",
+		color_discrete_map={"Positive": "#2a9d5c", "Negative": "#e05c2c"},
+	)
+	fig.update_traces(texttemplate="%{text:.0%}", textposition="outside")
+	fig.update_yaxes(tickformat=".0%", range=[0, 1.1])
+	st.plotly_chart(fig, use_container_width=True, key="compare_confidence_bar")
+
+	st.caption(
+		f"Image source: {comparison['image_source']} | "
+		f"Predicted rating: {comparison['predicted_rating']:.2f} | "
+		f"Category: {comparison['predicted_category']}"
+	)
+
+	predictions = {row["Model"]: row["Prediction"] for row in comparison["rows"]}
+	image_pred = predictions.get("Image Only", "—")
+	text_pred = predictions.get("Text Only", "—")
+	full_pred = predictions.get("Image + Text + Region", "—")
+
+	st.markdown("### What this shows")
+	if image_pred != text_pred:
+		st.info(
+			f"Image-only predicts **{image_pred}** while text-only predicts **{text_pred}**. "
+			"This is a perception gap case — a core research finding."
+		)
+	if full_pred != image_pred or full_pred != text_pred:
+		st.success(
+			f"The full model (Image + Text + Region) predicts **{full_pred}** — "
+			"incorporating all signals resolves the modality conflict."
+		)
+	else:
+		st.success(
+			"All four models agree. Strong alignment between visual and textual signals for this input."
+		)
+
+
+def render_compare_models() -> None:
+	reference_data = _get_demo_reference_data()
+	sample_image_path = _load_sample_demo_image(reference_data)
+
+	st.header("Compare Model Variants")
+	st.caption(
+		"Run all four ablation checkpoints on your saved inputs side by side. "
+		"This directly demonstrates the research question: does adding region context help?"
+	)
+
+	review_text = st.session_state.get("input_review_text", "")
+	region = st.session_state.get("input_region", "Nashville_TN")
+	cuisine = st.session_state.get("input_cuisine", "American (New)")
+	use_sample = st.session_state.get("input_use_sample", True)
+	image_bytes = st.session_state.get("input_image_bytes")
+
+	st.markdown("**Using inputs from Upload & Review tab:**")
+	inp1, inp2, inp3 = st.columns(3)
+	with inp1:
+		st.markdown(f"**Region:** {region}  \n**Cuisine:** {cuisine}")
+	with inp2:
+		if review_text:
+			st.caption(review_text[:120] + ("…" if len(review_text) > 120 else ""))
+		else:
+			st.caption("No review text saved.")
+	with inp3:
+		if image_bytes:
+			st.image(image_bytes, width=130, caption="Input image")
+		elif use_sample and sample_image_path:
+			st.image(sample_image_path, width=130, caption="Sample image")
+		else:
+			st.caption("No image.")
+
+	if not review_text:
+		st.warning("No review text found. Go to the **Upload & Review** tab first.")
+		return
+	if not image_bytes and not (use_sample and sample_image_path):
+		st.warning("No image available. Go to the **Upload & Review** tab first.")
+		return
+
+	run_compare = st.button("Run all 4 checkpoints", type="primary", key="run_compare_btn")
+
+	if not run_compare and "last_comparison_result" in st.session_state:
+		st.divider()
+		st.caption("Showing last comparison result. Click the button above to re-run.")
+		_display_comparison_result(st.session_state["last_comparison_result"])
+		return
+
+	if run_compare:
+		image_file = _get_image_from_session_or_sample(
+			image_bytes=image_bytes,
+			sample_image_path=sample_image_path,
+			use_sample=use_sample,
+		)
+		with st.spinner("Running all four checkpoints…"):
+			try:
+				comparison = _run_multimodal_comparison(
+					review_text=review_text,
+					uploaded_image=image_file,
+					region=region,
+					cuisine=cuisine,
+					sample_image_path=sample_image_path,
+					use_sample_image=use_sample,
+				)
+			except RuntimeError as exc:
+				st.error(str(exc))
+				return
+		st.session_state["last_comparison_result"] = comparison
+		st.divider()
+		_display_comparison_result(comparison)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SECTION 7 — Results & Limitations
+# ──────────────────────────────────────────────────────────────────────────────
+
+def render_results_and_limitations() -> None:
+	st.header("Results & Limitations")
+	st.caption(
+		"Full ablation table, key research findings, and an honest discussion of "
+		"where the model falls short."
+	)
+
+	ablation_df = load_csv(OUTPUT_DIR / "ablation_results.csv")
+
+	st.markdown("### Ablation results")
+	if ablation_df is not None and not ablation_df.empty:
+		ablation = _coerce_numeric_columns(ablation_df, ["F1", "Accuracy", "Precision", "Recall"])
+		st.dataframe(ablation, hide_index=True, use_container_width=True)
+
+		if {"Model", "F1", "Accuracy"}.issubset(ablation.columns):
+			fig = px.bar(
+				ablation.sort_values("F1"),
+				x="Model",
+				y="F1",
+				text="F1",
+				color="F1",
+				title="F1 Score by model variant",
+				color_continuous_scale="RdYlGn",
+			)
+			fig.update_traces(texttemplate="%{text:.4f}", textposition="outside")
+			fig.update_yaxes(range=[0, 1.08])
+			st.plotly_chart(fig, use_container_width=True, key="results_f1_bar")
+
+			best_row = ablation.sort_values("F1", ascending=False).iloc[0]
+			it_rows = ablation[
+				ablation["Model"].str.contains("Text", na=False, case=False) &
+				~ablation["Model"].str.contains("Region", na=False, case=False) &
+				ablation["Model"].str.contains("Image", na=False, case=False)
+			]
+			full_rows = ablation[ablation["Model"].str.contains("Region", na=False, case=False)]
+			img_only = ablation[ablation["Model"].str.strip() == "Image Only"]
+			txt_only = ablation[ablation["Model"].str.strip() == "Text Only"]
+
+			st.markdown("### Key findings")
+			findings: list[str] = []
+			findings.append(
+				f"**Best model:** {best_row['Model']} with F1 = {float(best_row['F1']):.4f} "
+				f"and Accuracy = {float(best_row['Accuracy']):.4f}."
+			)
+			if not it_rows.empty and not full_rows.empty:
+				f1_gain = float(full_rows.iloc[0]["F1"]) - float(it_rows.iloc[0]["F1"])
+				acc_gain = float(full_rows.iloc[0]["Accuracy"]) - float(it_rows.iloc[0]["Accuracy"])
+				findings.append(
+					f"**Region context adds value:** Adding region to Image + Text improves "
+					f"F1 by {f1_gain:+.4f} and Accuracy by {acc_gain:+.4f}."
+				)
+			if not img_only.empty and not txt_only.empty:
+				if float(txt_only.iloc[0]["F1"]) > float(img_only.iloc[0]["F1"]):
+					findings.append(
+						"**Text dominates image:** Text-only outperforms image-only, indicating "
+						"review text carries the stronger individual sentiment signal in this dataset."
+					)
+				else:
+					findings.append(
+						"**Visual signal is strong:** Image-only matches or outperforms text-only in this dataset."
+					)
+			for finding in findings:
+				st.markdown(f"- {finding}")
+	else:
+		st.info("Ablation results not found. Run yelp.py to generate outputs/ablation_results.csv.")
+
+	st.markdown("### Limitations")
+	for lim in [
+		"**Dataset scope:** Trained on the Yelp academic dataset — results may not generalize to all review platforms or international markets.",
+		"**Image availability:** Many Yelp businesses lack photo submissions. The model defaults to text-only fallback when no image is available.",
+		"**Region granularity:** Region is encoded at the city level. Neighborhood or zip-code context may improve accuracy further.",
+		"**Static checkpoints:** The deployed checkpoints are snapshots. New food trends, cities, and evolving language require periodic retraining.",
+		"**Binary sentiment:** The model outputs positive/negative sentiment. Nuanced aspects (service vs. food vs. ambiance) are collapsed.",
+		"**Perception gap coverage:** The mismatch detector was built on a subset of the dataset and may undercount gaps in specific niches.",
+	]:
+		st.markdown(f"- {lim}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main — 7-tab demo flow
+# ──────────────────────────────────────────────────────────────────────────────
+
 def main() -> None:
 	apply_app_theme()
 	sidebar_controls()
 
-	st.title("Yelp Food Intelligence App")
+	st.title("Yelp Food Intelligence")
 	st.caption(
-		"Real-world Streamlit demo for multimodal restaurant sentiment: upload a food image, add review text and region, then turn the prediction into a business insight."
+		"A multimodal sentiment system trained on Yelp reviews and food photos. "
+		"No training happens here — the app loads pre-trained checkpoints only."
 	)
 
-	landing_tab, prediction_tab, use_cases_tab = st.tabs(
-		[
-			"Landing",
-			"Live Prediction",
-			"Use Cases",
-		]
-	)
+	(
+		home_tab,
+		upload_tab,
+		predict_tab,
+		compare_tab,
+		region_tab,
+		gap_tab,
+		results_tab,
+	) = st.tabs([
+		"Home",
+		"Upload & Review",
+		"Predict Sentiment",
+		"Compare Models",
+		"Region & Cuisine",
+		"Perception Gaps",
+		"Results & Limitations",
+	])
 
-	with landing_tab:
-		render_landing_page()
-	with prediction_tab:
-		render_live_prediction_demo()
-	with use_cases_tab:
-		render_example_use_cases()
+	with home_tab:
+		render_home()
+	with upload_tab:
+		render_upload_review()
+	with predict_tab:
+		render_predict_sentiment()
+	with compare_tab:
+		render_compare_models()
+	with region_tab:
+		render_region_impact_demo()
+	with gap_tab:
+		render_perception_gap_explorer()
+	with results_tab:
+		render_results_and_limitations()
 
 
 if __name__ == "__main__":

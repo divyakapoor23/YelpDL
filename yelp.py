@@ -1,5 +1,6 @@
 import math
 import os
+import pickle
 import random
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -336,9 +337,9 @@ def safe_collate(batch):
 # Step 5: Model definitions
 # =========================================================
 class ImageOnlyModel(nn.Module):
-    def __init__(self):
+    def __init__(self, use_pretrained: bool = True):
         super().__init__()
-        backbone = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        backbone = models.resnet18(weights=models.ResNet18_Weights.DEFAULT if use_pretrained else None)
         num_features = backbone.fc.in_features
         backbone.fc = nn.Identity()
         self.backbone = backbone
@@ -466,11 +467,11 @@ class MultimodalFusionModel(nn.Module):
 class ImageTextFusionModel(nn.Module):
     """Image + Text fusion without region embedding (ablation: no geographic context)."""
 
-    def __init__(self, vocab_size: int):
+    def __init__(self, vocab_size: int, use_pretrained: bool = True):
         super().__init__()
 
         # Image branch
-        backbone = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        backbone = models.resnet18(weights=models.ResNet18_Weights.DEFAULT if use_pretrained else None)
         img_features = backbone.fc.in_features
         backbone.fc = nn.Identity()
         self.image_backbone = backbone
@@ -937,7 +938,7 @@ def image_text_consistency_analysis(
     print("IMAGE-TEXT CONSISTENCY ANALYSIS")
     print("=" * 72)
 
-    image_model = ImageOnlyModel().to(DEVICE)
+    image_model = ImageOnlyModel(use_pretrained=False).to(DEVICE)    
     text_model = TextOnlyModel(vocab_size, EMBED_DIM, LSTM_HIDDEN).to(DEVICE)
     image_model.load_state_dict(torch.load(image_ckpt, map_location=DEVICE))
     text_model.load_state_dict(torch.load(text_ckpt, map_location=DEVICE))
@@ -1115,9 +1116,9 @@ def final_presentation_plots(
     # 2) Confusion matrix for best model.
     best_model_name = plot_df.sort_values("F1", ascending=False).iloc[0]["Model"]
     model_map = {
-        "Image Only": (ImageOnlyModel(), "image", OUTPUT_DIR / "best_Image_Only.pt"),
+        "Image Only": (ImageOnlyModel(use_pretrained=False), "image", OUTPUT_DIR / "best_Image_Only.pt"),
         "Text Only": (TextOnlyModel(VOCAB_SIZE, EMBED_DIM, LSTM_HIDDEN), "text", OUTPUT_DIR / "best_Text_Only.pt"),
-        "Image + Text": (ImageTextFusionModel(VOCAB_SIZE), "image_text", OUTPUT_DIR / "best_Image_plus_Text.pt"),
+        "Image + Text": (ImageTextFusionModel(VOCAB_SIZE, use_pretrained=False), "image_text", OUTPUT_DIR / "best_Image_plus_Text.pt"),
         "Image + Text + Region": (
             MultimodalFusionModel(VOCAB_SIZE, num_regions, num_categories),
             "full",
@@ -1769,6 +1770,25 @@ def main():
 
     table_df.to_csv(OUTPUT_DIR / "ablation_results.csv", index=False)
     print(f"\nFull results saved to {OUTPUT_DIR / 'ablation_results.csv'}")
+
+    # Save tokenizer and mappings so the demo app can load them directly
+    # without re-reading the full Yelp dataset.
+    _mappings_meta = {
+        "unknown_region_id": unknown_region_id,
+        "unknown_category_id": unknown_category_id,
+        "num_regions": num_regions,
+        "num_categories": num_categories,
+    }
+    for _fname, _obj in [
+        ("tokenizer.pkl", tokenizer),
+        ("region_to_id.pkl", region_to_id),
+        ("category_to_id.pkl", category_to_id),
+        ("id_to_category.pkl", id_to_category),
+        ("mappings_meta.pkl", _mappings_meta),
+    ]:
+        with open(OUTPUT_DIR / _fname, "wb") as _fh:
+            pickle.dump(_obj, _fh)
+    print(f"Tokenizer and mappings saved to {OUTPUT_DIR}")
 
     # ── Image-Text Consistency Analysis ───────────────────────────────────
     image_text_consistency_analysis(

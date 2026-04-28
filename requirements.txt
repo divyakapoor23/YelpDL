@@ -1,0 +1,14 @@
+streamlit
+pandas
+numpy
+plotly
+seaborn
+torch
+torchvision
+tensorflow
+keras
+spacy
+scikit-learn
+corextopic
+vaderSentiment
+ipykernel

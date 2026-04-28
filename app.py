@@ -1259,207 +1259,7 @@ def sidebar_controls() -> None:
 
 
 
-def render_attention() -> None:
-	st.header("Attention")
-	st.caption(
-		"This page shows how sharp each attention stream is, whether region changes that focus, "
-		"and whether mistakes come with flatter attention patterns."
-	)
 
-	att_no_region = load_csv(OUTPUT_DIR / "attention_Image_plus_Text.csv")
-	att_region = load_csv(OUTPUT_DIR / "attention_Image_plus_Text_plus_Region.csv")
-	att_no_region_summary = load_csv(OUTPUT_DIR / "attention_Image_plus_Text_summary.csv")
-	att_region_summary = load_csv(OUTPUT_DIR / "attention_Image_plus_Text_plus_Region_summary.csv")
-
-	def _callout_card(title: str, value: str, note: str) -> None:
-		with st.container(border=True):
-			st.markdown(f"**{title}**")
-			st.markdown(
-				f"<div style='font-size: 2rem; font-weight: 700; line-height: 1.1; margin: 0.25rem 0 0.35rem 0;'>{value}</div>",
-				unsafe_allow_html=True,
-			)
-			st.caption(note)
-
-	def _prepare_attention_frame(df: pd.DataFrame | None, label: str) -> pd.DataFrame | None:
-		if df is None or df.empty:
-			return None
-		required = [
-			"img_concentration",
-			"txt_concentration",
-			"img_peak_focus",
-			"txt_peak_focus",
-			"correct",
-			"pred_confidence",
-		]
-		if not set(required).issubset(df.columns):
-			return None
-		clean = df.copy()
-		for column in required:
-			clean[column] = pd.to_numeric(clean[column], errors="coerce")
-		clean = clean.dropna(subset=required)
-		if clean.empty:
-			return None
-		clean["correct"] = clean["correct"].astype(int)
-		clean["outcome"] = clean["correct"].map({1: "Correct", 0: "Incorrect"})
-		clean["model"] = label
-		return clean
-
-	prepared_frames = [
-		_prepare_attention_frame(att_no_region, "Image + Text"),
-		_prepare_attention_frame(att_region, "Image + Text + Region"),
-	]
-	prepared_frames = [frame for frame in prepared_frames if frame is not None]
-
-	if not prepared_frames:
-		st.warning(
-			"The attention page now expects the richer export fields from yelp.py. Rerun yelp.py once to refresh the attention CSVs and unlock the new charts."
-		)
-		with st.expander("Raw exported summary CSVs"):
-			s1, s2 = st.columns(2)
-			with s1:
-				st.markdown("**Image + Text Summary**")
-				if att_no_region_summary is None or att_no_region_summary.empty:
-					st.info("No summary CSV found for Image + Text attention.")
-				else:
-					st.dataframe(att_no_region_summary, width="stretch")
-			with s2:
-				st.markdown("**Image + Text + Region Summary**")
-				if att_region_summary is None or att_region_summary.empty:
-					st.info("No summary CSV found for Image + Text + Region attention.")
-				else:
-					st.dataframe(att_region_summary, width="stretch")
-		return
-
-	combined = pd.concat(prepared_frames, ignore_index=True)
-	model_summary = (
-		combined.groupby("model", as_index=False)
-		.agg(
-			samples=("model", "size"),
-			image_focus=("img_concentration", "mean"),
-			text_focus=("txt_concentration", "mean"),
-			image_peak=("img_peak_focus", "mean"),
-			text_peak=("txt_peak_focus", "mean"),
-			accuracy=("correct", "mean"),
-			confidence=("pred_confidence", "mean"),
-		)
-	)
-
-	overall_text_focus = float(model_summary["text_focus"].mean())
-	overall_image_focus = float(model_summary["image_focus"].mean())
-	text_minus_image = overall_text_focus - overall_image_focus
-	correct_focus = float(combined.loc[combined["correct"] == 1, "txt_concentration"].mean()) if (combined["correct"] == 1).any() else float("nan")
-	incorrect_focus = float(combined.loc[combined["correct"] == 0, "txt_concentration"].mean()) if (combined["correct"] == 0).any() else float("nan")
-	mistake_gap = correct_focus - incorrect_focus if pd.notna(correct_focus) and pd.notna(incorrect_focus) else float("nan")
-	region_delta = None
-	base = model_summary.set_index("model")
-	if {"Image + Text", "Image + Text + Region"}.issubset(base.index):
-		region_delta = float(base.loc["Image + Text + Region", "text_focus"] - base.loc["Image + Text", "text_focus"])
-
-	st.subheader("Headline Takeaways")
-	card1, card2, card3 = st.columns(3)
-	with card1:
-		focus_winner = "Text stream sharper" if text_minus_image >= 0 else "Image stream sharper"
-		_callout_card(
-			"Main takeaway",
-			focus_winner,
-			f"Average focus gap: {abs(text_minus_image):.1%} between the two cross-attention streams.",
-		)
-	with card2:
-		if region_delta is None:
-			_callout_card("Region effect", "N/A", "Both multimodal models are needed to compare region impact.")
-		else:
-			region_value = f"{region_delta:+.1%}"
-			region_note = "Change in text-side focus after adding region context."
-			_callout_card("Region effect", region_value, region_note)
-	with card3:
-		if pd.isna(mistake_gap):
-			_callout_card("Error pattern", "N/A", "No correct/incorrect split was available in the export.")
-		else:
-			mistake_value = f"{mistake_gap:+.1%}"
-			mistake_note = "Correct predictions typically have higher text-focus concentration than errors." if mistake_gap >= 0 else "Errors are showing sharper text focus than correct predictions in this run."
-			_callout_card("Error pattern", mistake_value, mistake_note)
-
-	focus_chart = model_summary.melt(
-		id_vars="model",
-		value_vars=["image_focus", "text_focus"],
-		var_name="modality",
-		value_name="focus",
-	)
-	focus_chart["modality"] = focus_chart["modality"].map({"image_focus": "Image focus", "text_focus": "Text focus"})
-	fig_focus = px.bar(
-		focus_chart,
-		x="model",
-		y="focus",
-		color="modality",
-		barmode="group",
-		text="focus",
-		title="How Focused Is Each Attention Stream?",
-		labels={"model": "Model", "focus": "Normalized concentration", "modality": "Attention stream"},
-	)
-	fig_focus.update_traces(texttemplate="%{text:.1%}", textposition="outside")
-	fig_focus.update_yaxes(tickformat=".0%", range=[0, 1])
-	st.plotly_chart(fig_focus, width="stretch", key="attn_focus_by_model")
-	st.caption(
-		"A value closer to 1 means the attention distribution is more concentrated on a small set of tokens or patches; closer to 0 means it is flatter and more diffuse."
-	)
-
-	outcome_summary = (
-		combined.groupby(["model", "outcome"], as_index=False)
-		.agg(
-			image_focus=("img_concentration", "mean"),
-			text_focus=("txt_concentration", "mean"),
-			samples=("correct", "size"),
-		)
-	)
-	if outcome_summary["outcome"].nunique() > 1:
-		rich_chart = outcome_summary.melt(
-			id_vars=["model", "outcome", "samples"],
-			value_vars=["image_focus", "text_focus"],
-			var_name="modality",
-			value_name="focus",
-		)
-		rich_chart["modality"] = rich_chart["modality"].map({"image_focus": "Image focus", "text_focus": "Text focus"})
-		fig_outcome = px.bar(
-			rich_chart,
-			x="outcome",
-			y="focus",
-			color="model",
-			facet_col="modality",
-			barmode="group",
-			text="focus",
-			title="Do Mistakes Come With Flatter Attention?",
-			labels={"outcome": "Prediction outcome", "focus": "Mean normalized concentration", "model": "Model"},
-		)
-		fig_outcome.update_traces(texttemplate="%{text:.1%}", textposition="outside")
-		fig_outcome.update_yaxes(tickformat=".0%", range=[0, 1])
-		st.plotly_chart(fig_outcome, width="stretch", key="attn_focus_by_outcome")
-		st.caption(
-			"This richer chart uses the new yelp.py export fields. It compares attention sharpness for correct versus incorrect predictions instead of only showing overall averages."
-		)
-
-	if region_delta is not None and abs(region_delta) < 0.01:
-		st.info(
-			"Adding region barely changes attention sharpness. In this run, region helps mainly through the fused representation rather than by making cross-attention much more focused."
-		)
-	elif region_delta is not None:
-		st.info(
-			"Adding region produces a visible shift in attention sharpness, which suggests the geographic signal changes how selectively the model attends to text or image evidence."
-		)
-
-	with st.expander("Raw exported summary CSVs"):
-		s1, s2 = st.columns(2)
-		with s1:
-			st.markdown("**Image + Text Summary**")
-			if att_no_region_summary is None or att_no_region_summary.empty:
-				st.info("No summary CSV found for Image + Text attention.")
-			else:
-				st.dataframe(att_no_region_summary, width="stretch")
-		with s2:
-			st.markdown("**Image + Text + Region Summary**")
-			if att_region_summary is None or att_region_summary.empty:
-				st.info("No summary CSV found for Image + Text + Region attention.")
-			else:
-				st.dataframe(att_region_summary, width="stretch")
 
 
 def render_retrieval() -> None:
@@ -1489,62 +1289,7 @@ def render_retrieval() -> None:
 				st.divider()
 
 
-def render_consistency() -> None:
-	st.header("Perception Gap")
-	mismatch_df = load_csv(OUTPUT_DIR / "image_text_consistency_predictions.csv")
-	mismatch_only_df = load_csv(OUTPUT_DIR / "image_text_consistency_mismatches.csv")
-	region_summary = load_csv(OUTPUT_DIR / "image_text_consistency_region_summary.csv")
-	cuisine_summary = load_csv(OUTPUT_DIR / "image_text_consistency_cuisine_summary.csv")
-	rating_quality_summary = load_csv(OUTPUT_DIR / "image_text_consistency_rating_quality_summary.csv")
-	if mismatch_df is None or mismatch_df.empty:
-		st.info("No consistency analysis outputs found.")
-		return
 
-	mismatch_rate = mismatch_df["mismatch"].mean()
-	col1, col2, col3 = st.columns(3)
-	with col1:
-		metric_card("Perception Gap Rate", f"{mismatch_rate:.4f}")
-	with col2:
-		metric_card("Image positive / Text negative", str(int(mismatch_df["img_pos_txt_neg"].sum())))
-	with col3:
-		metric_card("Image negative / Text positive", str(int(mismatch_df["img_neg_txt_pos"].sum())))
-
-	if region_summary is not None and not region_summary.empty:
-		fig = px.bar(
-			region_summary.sort_values("mismatch_rate", ascending=False).head(12),
-			x="region",
-			y="mismatch_rate",
-			title="Top Regions by Perception Gap",
-			color="mismatch_rate",
-		)
-		st.plotly_chart(fig, width="stretch", key="consistency_region_bar")
-
-	c1, c2 = st.columns(2)
-	with c1:
-		if cuisine_summary is not None and not cuisine_summary.empty:
-			fig = px.bar(
-				cuisine_summary.sort_values("mismatch_rate", ascending=False).head(12),
-				x="cuisine",
-				y="mismatch_rate",
-				color="mismatch_rate",
-				title="Perception Gap by Cuisine",
-			)
-			st.plotly_chart(fig, width="stretch", key="consistency_cuisine_bar")
-	with c2:
-		if rating_quality_summary is not None and not rating_quality_summary.empty:
-			fig = px.bar(
-				rating_quality_summary,
-				x="rating_quality_cluster",
-				y="mismatch_rate",
-				color="mismatch_rate",
-				title="Perception Gap by Rating-Quality Proxy",
-			)
-			st.plotly_chart(fig, width="stretch", key="consistency_rating_bar")
-	st.subheader("Mismatch Samples")
-	if mismatch_only_df is not None and not mismatch_only_df.empty:
-		st.dataframe(mismatch_only_df.head(100), width="stretch")
-	else:
-		st.dataframe(mismatch_df[mismatch_df["mismatch"]].head(100), width="stretch")
 
 
 def render_presentation_plots() -> None:
@@ -1927,14 +1672,12 @@ def main() -> None:
 		"Real-world Streamlit demo for multimodal restaurant sentiment: upload a food image, add review text and region, then turn the prediction into a business insight."
 	)
 
-	landing_tab, prediction_tab, use_cases_tab, explainability_tab, attention_tab, consistency_tab, retrieval_tab, text_tab, visual_tab, presentation_tab = st.tabs(
+	landing_tab, prediction_tab, use_cases_tab, explainability_tab, retrieval_tab, text_tab, visual_tab, presentation_tab = st.tabs(
 		[
 			"Landing",
 			"Live Prediction",
 			"Use Cases",
 			"Explainability",
-			"Attention",
-			"Perception Gap",
 			"Retrieval",
 			"Text",
 			"Visual",
@@ -1950,10 +1693,6 @@ def main() -> None:
 		render_example_use_cases()
 	with explainability_tab:
 		render_demo_explainability()
-	with attention_tab:
-		render_attention()
-	with consistency_tab:
-		render_consistency()
 	with retrieval_tab:
 		render_retrieval()
 	with text_tab:

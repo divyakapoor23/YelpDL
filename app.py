@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import subprocess
 import sys
 import shutil
@@ -11,14 +12,50 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 PYTHON_BIN = sys.executable
-JSON_DATA_DIR = PROJECT_ROOT / "Data" / "Yelp JSON" / "yelp_dataset"
-PHOTO_DATA_DIR = PROJECT_ROOT / "Data" / "Yelp Photos" / "yelp_photos"
+
+
+def _resolve_env_path(name: str, default: Path) -> Path:
+	raw_value = os.getenv(name)
+	if raw_value:
+		return Path(raw_value).expanduser()
+	try:
+		secret_value = st.secrets.get(name)
+	except Exception:
+		secret_value = None
+	if secret_value:
+		return Path(str(secret_value)).expanduser()
+	return default
+
+
+DATA_PATH_ENV_VARS = [
+	"YELP_DATA_ROOT",
+	"YELP_JSON_DATA_DIR",
+	"YELP_PHOTO_DATA_DIR",
+	"YELP_BUSINESS_PATH",
+	"YELP_REVIEW_PATH",
+	"YELP_PHOTO_META_PATH",
+	"YELP_PHOTO_IMAGES_DIR",
+]
+
+DATA_ROOT = _resolve_env_path("YELP_DATA_ROOT", PROJECT_ROOT / "Data")
+JSON_DATA_DIR = _resolve_env_path("YELP_JSON_DATA_DIR", DATA_ROOT / "Yelp JSON" / "yelp_dataset")
+PHOTO_DATA_DIR = _resolve_env_path("YELP_PHOTO_DATA_DIR", DATA_ROOT / "Yelp Photos" / "yelp_photos")
+BUSINESS_PATH = _resolve_env_path(
+	"YELP_BUSINESS_PATH",
+	JSON_DATA_DIR / "yelp_academic_dataset_business.json",
+)
+REVIEW_PATH = _resolve_env_path(
+	"YELP_REVIEW_PATH",
+	JSON_DATA_DIR / "yelp_academic_dataset_review.json",
+)
+PHOTO_META_PATH = _resolve_env_path("YELP_PHOTO_META_PATH", PHOTO_DATA_DIR / "photos.json")
+PHOTO_IMAGES_DIR = _resolve_env_path("YELP_PHOTO_IMAGES_DIR", PHOTO_DATA_DIR / "photos")
 
 REQUIRED_PIPELINE_INPUTS = [
-	JSON_DATA_DIR / "yelp_academic_dataset_business.json",
-	JSON_DATA_DIR / "yelp_academic_dataset_review.json",
-	PHOTO_DATA_DIR / "photos.json",
-	PHOTO_DATA_DIR / "photos",
+	BUSINESS_PATH,
+	REVIEW_PATH,
+	PHOTO_META_PATH,
+	PHOTO_IMAGES_DIR,
 ]
 
 RESEARCH_QUESTION = (
@@ -57,6 +94,20 @@ def missing_pipeline_inputs() -> list[Path]:
 	return [path for path in REQUIRED_PIPELINE_INPUTS if not path.exists()]
 
 
+def build_pipeline_env() -> dict[str, str]:
+	env = os.environ.copy()
+	for key in DATA_PATH_ENV_VARS:
+		if key in env and env[key]:
+			continue
+		try:
+			secret_value = st.secrets.get(key)
+		except Exception:
+			secret_value = None
+		if secret_value:
+			env[key] = str(secret_value)
+	return env
+
+
 def sidebar_controls() -> None:
 	st.sidebar.title("Controls")
 	st.sidebar.caption("Run the training/analysis pipeline or inspect saved outputs.")
@@ -79,11 +130,14 @@ def sidebar_controls() -> None:
 	if run_pipeline:
 		with st.sidebar:
 			with st.spinner("Running yelp.py. This can take several minutes..."):
+				pipeline_env = build_pipeline_env()
 				if missing_inputs:
 					st.session_state["pipeline_stdout"] = ""
 					st.session_state["pipeline_stderr"] = (
 						"Pipeline inputs are missing. Please add these paths:\n"
 						+ "\n".join(str(path) for path in missing_inputs)
+						+ "\n\nSet one or more of: "
+						+ ", ".join(DATA_PATH_ENV_VARS)
 					)
 					st.session_state["pipeline_code"] = 127
 					load_csv.clear()
@@ -111,6 +165,7 @@ def sidebar_controls() -> None:
 							cwd=PROJECT_ROOT,
 							capture_output=True,
 							text=True,
+							env=pipeline_env,
 						)
 						st.session_state["pipeline_stdout"] = result.stdout
 						st.session_state["pipeline_stderr"] = result.stderr
@@ -412,7 +467,7 @@ def _render_region_impact_callout(ablation: pd.DataFrame, key_prefix: str = "ove
 def render_attention() -> None:
 	st.header("Attention")
 	st.caption(
-		"This page is presentation-focused: it shows how sharp each attention stream is, whether region changes that focus, "
+		"This page shows how sharp each attention stream is, whether region changes that focus, "
 		"and whether mistakes come with flatter attention patterns."
 	)
 

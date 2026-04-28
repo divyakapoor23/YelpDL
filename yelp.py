@@ -53,14 +53,30 @@ else:
     DEVICE = torch.device("cpu")
 print(f"Using device: {DEVICE}")
 
-# Resolve dataset paths relative to this file so runs work from any cwd.
+# Resolve dataset paths from environment variables with local defaults.
 PROJECT_ROOT = Path(__file__).resolve().parent
-JSON_DATA_DIR = PROJECT_ROOT / "Data" / "Yelp JSON" / "yelp_dataset"
-PHOTO_DATA_DIR = PROJECT_ROOT / "Data" / "Yelp Photos" / "yelp_photos"
-BUSINESS_PATH = JSON_DATA_DIR / "yelp_academic_dataset_business.json"
-REVIEW_PATH = JSON_DATA_DIR / "yelp_academic_dataset_review.json"
-PHOTO_META_PATH = PHOTO_DATA_DIR / "photos.json"
-PHOTO_DIR = PHOTO_DATA_DIR / "photos"
+
+
+def env_path(name: str, default: Path) -> Path:
+    raw_value = os.getenv(name)
+    if raw_value:
+        return Path(raw_value).expanduser()
+    return default
+
+
+DATA_ROOT = env_path("YELP_DATA_ROOT", PROJECT_ROOT / "Data")
+JSON_DATA_DIR = env_path("YELP_JSON_DATA_DIR", DATA_ROOT / "Yelp JSON" / "yelp_dataset")
+PHOTO_DATA_DIR = env_path("YELP_PHOTO_DATA_DIR", DATA_ROOT / "Yelp Photos" / "yelp_photos")
+BUSINESS_PATH = env_path(
+    "YELP_BUSINESS_PATH",
+    JSON_DATA_DIR / "yelp_academic_dataset_business.json",
+)
+REVIEW_PATH = env_path(
+    "YELP_REVIEW_PATH",
+    JSON_DATA_DIR / "yelp_academic_dataset_review.json",
+)
+PHOTO_META_PATH = env_path("YELP_PHOTO_META_PATH", PHOTO_DATA_DIR / "photos.json")
+PHOTO_DIR = env_path("YELP_PHOTO_IMAGES_DIR", PHOTO_DATA_DIR / "photos")
 
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

@@ -1,5 +1,6 @@
 from pathlib import Path
 import subprocess
+import sys
 
 import pandas as pd
 import plotly.express as px
@@ -8,7 +9,7 @@ import streamlit as st
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
-PYTHON_BIN = "/opt/anaconda3/envs/YelpDL/bin/python"
+PYTHON_BIN = sys.executable
 RESEARCH_QUESTION = (
 	"How do visual, textual, and regional signals interact to shape perceived food sentiment, "
 	"and does incorporating geographic context improve multimodal sentiment prediction?"
@@ -37,7 +38,7 @@ def render_table_or_message(df: pd.DataFrame | None, message: str) -> bool:
 	if df is None or df.empty:
 		st.info(message)
 		return False
-	st.dataframe(df, use_container_width=True)
+	st.dataframe(df, width="stretch")
 	return True
 
 
@@ -47,18 +48,23 @@ def sidebar_controls() -> None:
 	st.sidebar.markdown("**Research Question**")
 	st.sidebar.write(RESEARCH_QUESTION)
 
-	if st.sidebar.button("Run yelp.py", use_container_width=True):
+	if st.sidebar.button("Run yelp.py", width="stretch"):
 		with st.sidebar:
 			with st.spinner("Running yelp.py. This can take several minutes..."):
-				result = subprocess.run(
-					[PYTHON_BIN, "-u", "yelp.py"],
-					cwd=PROJECT_ROOT,
-					capture_output=True,
-					text=True,
-				)
-				st.session_state["pipeline_stdout"] = result.stdout
-				st.session_state["pipeline_stderr"] = result.stderr
-				st.session_state["pipeline_code"] = result.returncode
+				try:
+					result = subprocess.run(
+						[PYTHON_BIN, "-u", "yelp.py"],
+						cwd=PROJECT_ROOT,
+						capture_output=True,
+						text=True,
+					)
+					st.session_state["pipeline_stdout"] = result.stdout
+					st.session_state["pipeline_stderr"] = result.stderr
+					st.session_state["pipeline_code"] = result.returncode
+				except FileNotFoundError as exc:
+					st.session_state["pipeline_stdout"] = ""
+					st.session_state["pipeline_stderr"] = str(exc)
+					st.session_state["pipeline_code"] = 127
 				load_csv.clear()
 
 	if "pipeline_code" in st.session_state:
@@ -113,10 +119,10 @@ def render_overview() -> None:
 	)
 	fig.update_traces(texttemplate="%{text:.4f}", textposition="outside")
 	fig.update_layout(showlegend=False, height=420)
-	st.plotly_chart(fig, use_container_width=True, key="overview_ablation_f1_bar")
+	st.plotly_chart(fig, width="stretch", key="overview_ablation_f1_bar")
 
 	st.subheader("Ablation Table")
-	st.dataframe(chart_df, use_container_width=True)
+	st.dataframe(chart_df, width="stretch")
 
 	# ── Written results section ─────────────────────────────────────────────
 	st.divider()
@@ -345,7 +351,7 @@ def _render_region_impact_callout(ablation: pd.DataFrame, key_prefix: str = "ove
 		color_discrete_sequence=["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"],
 	)
 	fig.update_layout(height=420, legend_title="Metric")
-	st.plotly_chart(fig, use_container_width=True, key=f"region_callout_metrics_bar_{key_prefix}")
+	st.plotly_chart(fig, width="stretch", key=f"region_callout_metrics_bar_{key_prefix}")
 
 
 
@@ -411,13 +417,13 @@ def render_attention() -> None:
 				if att_no_region_summary is None or att_no_region_summary.empty:
 					st.info("No summary CSV found for Image + Text attention.")
 				else:
-					st.dataframe(att_no_region_summary, use_container_width=True)
+					st.dataframe(att_no_region_summary, width="stretch")
 			with s2:
 				st.markdown("**Image + Text + Region Summary**")
 				if att_region_summary is None or att_region_summary.empty:
 					st.info("No summary CSV found for Image + Text + Region attention.")
 				else:
-					st.dataframe(att_region_summary, use_container_width=True)
+					st.dataframe(att_region_summary, width="stretch")
 		return
 
 	combined = pd.concat(prepared_frames, ignore_index=True)
@@ -488,7 +494,7 @@ def render_attention() -> None:
 	)
 	fig_focus.update_traces(texttemplate="%{text:.1%}", textposition="outside")
 	fig_focus.update_yaxes(tickformat=".0%", range=[0, 1])
-	st.plotly_chart(fig_focus, use_container_width=True, key="attn_focus_by_model")
+	st.plotly_chart(fig_focus, width="stretch", key="attn_focus_by_model")
 	st.caption(
 		"A value closer to 1 means the attention distribution is more concentrated on a small set of tokens or patches; closer to 0 means it is flatter and more diffuse."
 	)
@@ -522,7 +528,7 @@ def render_attention() -> None:
 		)
 		fig_outcome.update_traces(texttemplate="%{text:.1%}", textposition="outside")
 		fig_outcome.update_yaxes(tickformat=".0%", range=[0, 1])
-		st.plotly_chart(fig_outcome, use_container_width=True, key="attn_focus_by_outcome")
+		st.plotly_chart(fig_outcome, width="stretch", key="attn_focus_by_outcome")
 		st.caption(
 			"This richer chart uses the new yelp.py export fields. It compares attention sharpness for correct versus incorrect predictions instead of only showing overall averages."
 		)
@@ -543,13 +549,13 @@ def render_attention() -> None:
 			if att_no_region_summary is None or att_no_region_summary.empty:
 				st.info("No summary CSV found for Image + Text attention.")
 			else:
-				st.dataframe(att_no_region_summary, use_container_width=True)
+				st.dataframe(att_no_region_summary, width="stretch")
 		with s2:
 			st.markdown("**Image + Text + Region Summary**")
 			if att_region_summary is None or att_region_summary.empty:
 				st.info("No summary CSV found for Image + Text + Region attention.")
 			else:
-				st.dataframe(att_region_summary, use_container_width=True)
+				st.dataframe(att_region_summary, width="stretch")
 
 
 def render_retrieval() -> None:
@@ -607,7 +613,7 @@ def render_consistency() -> None:
 			title="Top Regions by Perception Gap",
 			color="mismatch_rate",
 		)
-		st.plotly_chart(fig, use_container_width=True, key="consistency_region_bar")
+		st.plotly_chart(fig, width="stretch", key="consistency_region_bar")
 
 	c1, c2 = st.columns(2)
 	with c1:
@@ -619,7 +625,7 @@ def render_consistency() -> None:
 				color="mismatch_rate",
 				title="Perception Gap by Cuisine",
 			)
-			st.plotly_chart(fig, use_container_width=True, key="consistency_cuisine_bar")
+			st.plotly_chart(fig, width="stretch", key="consistency_cuisine_bar")
 	with c2:
 		if rating_quality_summary is not None and not rating_quality_summary.empty:
 			fig = px.bar(
@@ -629,12 +635,12 @@ def render_consistency() -> None:
 				color="mismatch_rate",
 				title="Perception Gap by Rating-Quality Proxy",
 			)
-			st.plotly_chart(fig, use_container_width=True, key="consistency_rating_bar")
+			st.plotly_chart(fig, width="stretch", key="consistency_rating_bar")
 	st.subheader("Mismatch Samples")
 	if mismatch_only_df is not None and not mismatch_only_df.empty:
-		st.dataframe(mismatch_only_df.head(100), use_container_width=True)
+		st.dataframe(mismatch_only_df.head(100), width="stretch")
 	else:
-		st.dataframe(mismatch_df[mismatch_df["mismatch"]].head(100), use_container_width=True)
+		st.dataframe(mismatch_df[mismatch_df["mismatch"]].head(100), width="stretch")
 
 
 def render_presentation_plots() -> None:
@@ -689,7 +695,7 @@ def render_presentation_plots() -> None:
 		for col, (title, path, talk_track) in zip(cols, available[idx:idx + 2]):
 			with col:
 				st.subheader(title)
-				st.image(str(path), caption=path.name, use_container_width=True)
+				st.image(str(path), caption=path.name, width="stretch")
 				st.caption(talk_track)
 
 
@@ -707,10 +713,10 @@ def render_text_analysis() -> None:
 	left, right = st.columns(2)
 	with left:
 		st.subheader("Top Positive Keywords")
-		st.dataframe(pos_terms, use_container_width=True)
+		st.dataframe(pos_terms, width="stretch")
 	with right:
 		st.subheader("Top Negative Keywords")
-		st.dataframe(neg_terms, use_container_width=True)
+		st.dataframe(neg_terms, width="stretch")
 
 	if keyword_plot.exists():
 		st.image(str(keyword_plot), caption="TF-IDF keyword importance")
@@ -747,7 +753,7 @@ def render_visual_features() -> None:
 			opacity=0.65,
 		)
 	fig.update_traces(marker=dict(size=5))
-	st.plotly_chart(fig, use_container_width=True, key="visual_tsne_scatter")
+	st.plotly_chart(fig, width="stretch", key="visual_tsne_scatter")
 
 	image_cols = st.columns(3)
 	for column, image_name in zip(
@@ -797,7 +803,7 @@ def _render_noise_analysis(noise_df: pd.DataFrame | None) -> None:
 	)
 	fig_overview.update_traces(textposition="outside")
 	fig_overview.update_layout(yaxis_range=[0, 1.1])
-	st.plotly_chart(fig_overview, use_container_width=True, key="noise_overview_f1_bar")
+	st.plotly_chart(fig_overview, width="stretch", key="noise_overview_f1_bar")
 
 	col1, col2, col3 = st.columns(3)
 
@@ -829,7 +835,7 @@ def _render_noise_analysis(noise_df: pd.DataFrame | None) -> None:
 			)
 			fig.update_traces(textposition="outside")
 			fig.update_layout(showlegend=False, yaxis_range=[0, 1.1])
-			st.plotly_chart(fig, use_container_width=True, key="noise_review_length_bar")
+			st.plotly_chart(fig, width="stretch", key="noise_review_length_bar")
 
 			# Written interpretation
 			if f1_s is not None and f1_l is not None:
@@ -882,7 +888,7 @@ def _render_noise_analysis(noise_df: pd.DataFrame | None) -> None:
 			)
 			fig.update_traces(textposition="outside")
 			fig.update_layout(showlegend=False, yaxis_range=[0, 1.1])
-			st.plotly_chart(fig, use_container_width=True, key="noise_caption_availability_bar")
+			st.plotly_chart(fig, width="stretch", key="noise_caption_availability_bar")
 
 			# Written interpretation
 			if f1_w is not None and f1_wo is not None:
@@ -934,7 +940,7 @@ def _render_noise_analysis(noise_df: pd.DataFrame | None) -> None:
 			)
 			fig.update_traces(textposition="outside")
 			fig.update_layout(showlegend=False, yaxis_range=[0, 1.1])
-			st.plotly_chart(fig, use_container_width=True, key="noise_image_quality_bar")
+			st.plotly_chart(fig, width="stretch", key="noise_image_quality_bar")
 
 			# Written interpretation
 			if f1_lo is not None and f1_hi is not None:
@@ -1034,7 +1040,7 @@ def render_region_and_quality() -> None:
 				color="positive_rate",
 				title="Most Positive Regions",
 			)
-			st.plotly_chart(fig, use_container_width=True, key="region_positive_rate_bar")
+			st.plotly_chart(fig, width="stretch", key="region_positive_rate_bar")
 
 			heatmap_df = region_df.copy()
 			heatmap_df["bucket"] = pd.cut(
@@ -1052,7 +1058,7 @@ def render_region_and_quality() -> None:
 				title="Region Variation Heatmap (Sentiment Bucket Density)",
 			)
 			fig.update_xaxes(showticklabels=False)
-			st.plotly_chart(fig, use_container_width=True, key="region_bucket_density_heatmap")
+			st.plotly_chart(fig, width="stretch", key="region_bucket_density_heatmap")
 
 	with right:
 		st.subheader("Data Quality / Noise Overview")
@@ -1072,10 +1078,10 @@ def render_region_and_quality() -> None:
 			)
 			fig.update_traces(textposition="outside")
 			fig.update_layout(yaxis_range=[0, 1.1])
-			st.plotly_chart(fig, use_container_width=True, key="region_tab_noise_overview_bar")
+			st.plotly_chart(fig, width="stretch", key="region_tab_noise_overview_bar")
 		if spread_df is not None and not spread_df.empty:
 			st.subheader("Same Cuisine, Different Region")
-			st.dataframe(spread_df.head(15), use_container_width=True)
+			st.dataframe(spread_df.head(15), width="stretch")
 
 	# ── Full-width noisy data analysis section ───────────────────────────────
 	st.divider()
@@ -1217,7 +1223,7 @@ def render_research_insights() -> None:
 			],
 		}
 	)
-	st.dataframe(evidence, use_container_width=True)
+	st.dataframe(evidence, width="stretch")
 
 
 def main() -> None:

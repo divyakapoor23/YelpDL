@@ -3,6 +3,9 @@ import os
 import subprocess
 import sys
 import shutil
+import tarfile
+import urllib.request
+import zipfile
 
 import pandas as pd
 import plotly.express as px
@@ -37,26 +40,130 @@ DATA_PATH_ENV_VARS = [
 	"YELP_PHOTO_IMAGES_DIR",
 ]
 
-DATA_ROOT = _resolve_env_path("YELP_DATA_ROOT", PROJECT_ROOT / "Data")
-JSON_DATA_DIR = _resolve_env_path("YELP_JSON_DATA_DIR", DATA_ROOT / "Yelp JSON" / "yelp_dataset")
-PHOTO_DATA_DIR = _resolve_env_path("YELP_PHOTO_DATA_DIR", DATA_ROOT / "Yelp Photos" / "yelp_photos")
-BUSINESS_PATH = _resolve_env_path(
-	"YELP_BUSINESS_PATH",
-	JSON_DATA_DIR / "yelp_academic_dataset_business.json",
-)
-REVIEW_PATH = _resolve_env_path(
-	"YELP_REVIEW_PATH",
-	JSON_DATA_DIR / "yelp_academic_dataset_review.json",
-)
-PHOTO_META_PATH = _resolve_env_path("YELP_PHOTO_META_PATH", PHOTO_DATA_DIR / "photos.json")
-PHOTO_IMAGES_DIR = _resolve_env_path("YELP_PHOTO_IMAGES_DIR", PHOTO_DATA_DIR / "photos")
-
-REQUIRED_PIPELINE_INPUTS = [
-	BUSINESS_PATH,
-	REVIEW_PATH,
-	PHOTO_META_PATH,
-	PHOTO_IMAGES_DIR,
+DATA_URL_ENV_VARS = [
+	"YELP_BUSINESS_URL",
+	"YELP_REVIEW_URL",
+	"YELP_PHOTO_META_URL",
+	"YELP_PHOTO_IMAGES_ARCHIVE_URL",
+	"YELP_RUNTIME_DATA_ROOT",
 ]
+
+
+def _resolve_setting(name: str) -> str | None:
+	raw_value = os.getenv(name)
+	if raw_value:
+		return raw_value
+	try:
+		secret_value = st.secrets.get(name)
+	except Exception:
+		secret_value = None
+	if secret_value:
+		return str(secret_value)
+	return None
+
+
+def _set_pipeline_paths(data_root_override: Path | None = None) -> None:
+	global DATA_ROOT, JSON_DATA_DIR, PHOTO_DATA_DIR
+	global BUSINESS_PATH, REVIEW_PATH, PHOTO_META_PATH, PHOTO_IMAGES_DIR
+	global REQUIRED_PIPELINE_INPUTS
+
+	if data_root_override is not None:
+		DATA_ROOT = data_root_override
+	else:
+		DATA_ROOT = _resolve_env_path("YELP_DATA_ROOT", PROJECT_ROOT / "Data")
+
+	JSON_DATA_DIR = _resolve_env_path("YELP_JSON_DATA_DIR", DATA_ROOT / "Yelp JSON" / "yelp_dataset")
+	PHOTO_DATA_DIR = _resolve_env_path("YELP_PHOTO_DATA_DIR", DATA_ROOT / "Yelp Photos" / "yelp_photos")
+	BUSINESS_PATH = _resolve_env_path(
+		"YELP_BUSINESS_PATH",
+		JSON_DATA_DIR / "yelp_academic_dataset_business.json",
+	)
+	REVIEW_PATH = _resolve_env_path(
+		"YELP_REVIEW_PATH",
+		JSON_DATA_DIR / "yelp_academic_dataset_review.json",
+	)
+	PHOTO_META_PATH = _resolve_env_path("YELP_PHOTO_META_PATH", PHOTO_DATA_DIR / "photos.json")
+	PHOTO_IMAGES_DIR = _resolve_env_path("YELP_PHOTO_IMAGES_DIR", PHOTO_DATA_DIR / "photos")
+
+	REQUIRED_PIPELINE_INPUTS = [
+		BUSINESS_PATH,
+		REVIEW_PATH,
+		PHOTO_META_PATH,
+		PHOTO_IMAGES_DIR,
+	]
+
+
+def _download_file(url: str, destination: Path) -> None:
+	destination.parent.mkdir(parents=True, exist_ok=True)
+	with urllib.request.urlopen(url) as response, destination.open("wb") as out_file:
+		shutil.copyfileobj(response, out_file)
+
+
+def prepare_pipeline_inputs_from_urls() -> tuple[list[str], list[str]]:
+	logs: list[str] = []
+	errors: list[str] = []
+
+	runtime_root = Path(
+		_resolve_setting("YELP_RUNTIME_DATA_ROOT")
+		or os.getenv("YELP_RUNTIME_DATA_ROOT")
+		or "/tmp/yelp_data"
+	).expanduser()
+	json_dir = runtime_root / "Yelp JSON" / "yelp_dataset"
+	photo_dir = runtime_root / "Yelp Photos" / "yelp_photos"
+	photos_dir = photo_dir / "photos"
+
+	url_targets = [
+		("YELP_BUSINESS_URL", json_dir / "yelp_academic_dataset_business.json"),
+		("YELP_REVIEW_URL", json_dir / "yelp_academic_dataset_review.json"),
+		("YELP_PHOTO_META_URL", photo_dir / "photos.json"),
+	]
+
+	for key, target in url_targets:
+		if target.exists():
+			logs.append(f"Found existing file: {target}")
+			continue
+		url = _resolve_setting(key)
+		if not url:
+			errors.append(f"Missing configuration: {key}")
+			continue
+		try:
+			_download_file(url, target)
+			logs.append(f"Downloaded {key} -> {target}")
+		except Exception as exc:
+			errors.append(f"Failed downloading {key}: {exc}")
+
+	archive_url = _resolve_setting("YELP_PHOTO_IMAGES_ARCHIVE_URL")
+	if photos_dir.exists() and any(photos_dir.glob("*.jpg")):
+		logs.append(f"Found existing photos directory: {photos_dir}")
+	elif archive_url:
+		archive_name = Path(archive_url).name or "photos_archive"
+		archive_path = runtime_root / archive_name
+		try:
+			_download_file(archive_url, archive_path)
+			photos_dir.mkdir(parents=True, exist_ok=True)
+			if archive_path.suffix.lower() == ".zip":
+				with zipfile.ZipFile(archive_path, "r") as zf:
+					zf.extractall(photo_dir)
+			elif archive_path.suffix.lower() in {".gz", ".tgz", ".tar"}:
+				with tarfile.open(archive_path, "r:*") as tf:
+					tf.extractall(photo_dir)
+			else:
+				errors.append(
+					"Unsupported archive format for YELP_PHOTO_IMAGES_ARCHIVE_URL. "
+					"Use .zip, .tar, .tar.gz, or .tgz."
+				)
+			logs.append(f"Downloaded and extracted image archive -> {photo_dir}")
+		except Exception as exc:
+			errors.append(f"Failed preparing photo archive: {exc}")
+	else:
+		errors.append("Missing configuration: YELP_PHOTO_IMAGES_ARCHIVE_URL")
+
+	os.environ["YELP_DATA_ROOT"] = str(runtime_root)
+	_set_pipeline_paths(data_root_override=runtime_root)
+
+	return logs, errors
+
+_set_pipeline_paths()
 
 RESEARCH_QUESTION = (
 	"How do visual, textual, and regional signals interact to shape perceived food sentiment, "
@@ -96,7 +203,7 @@ def missing_pipeline_inputs() -> list[Path]:
 
 def build_pipeline_env() -> dict[str, str]:
 	env = os.environ.copy()
-	for key in DATA_PATH_ENV_VARS:
+	for key in DATA_PATH_ENV_VARS + DATA_URL_ENV_VARS:
 		if key in env and env[key]:
 			continue
 		try:
@@ -114,6 +221,17 @@ def sidebar_controls() -> None:
 	st.sidebar.markdown("**Research Question**")
 	st.sidebar.write(RESEARCH_QUESTION)
 
+	if st.sidebar.button("Prepare data from URLs", width="stretch"):
+		with st.sidebar:
+			with st.spinner("Preparing runtime data files..."):
+				logs, errors = prepare_pipeline_inputs_from_urls()
+				st.session_state["data_prepare_logs"] = "\n".join(logs) if logs else ""
+				st.session_state["data_prepare_errors"] = "\n".join(errors) if errors else ""
+				if errors:
+					st.error("Data preparation completed with issues. See logs below.")
+				else:
+					st.success("Runtime data prepared successfully.")
+
 	missing_inputs = missing_pipeline_inputs()
 	if missing_inputs:
 		st.sidebar.warning(
@@ -121,10 +239,25 @@ def sidebar_controls() -> None:
 			"You can still explore the precomputed outputs below."
 		)
 
+	with st.sidebar.expander("Pipeline input status"):
+		for path in REQUIRED_PIPELINE_INPUTS:
+			status = "OK" if path.exists() else "Missing"
+			st.write(f"{status}: {path}")
+		st.caption("Configure one or more path variables via environment or Streamlit secrets.")
+		st.caption(", ".join(DATA_PATH_ENV_VARS))
+
+	with st.sidebar.expander("Data bootstrap settings"):
+		for key in DATA_URL_ENV_VARS:
+			configured = bool(_resolve_setting(key))
+			st.write(f"{'Configured' if configured else 'Not set'}: {key}")
+		if st.session_state.get("data_prepare_logs"):
+			st.text_area("Prepare logs", st.session_state["data_prepare_logs"], height=180)
+		if st.session_state.get("data_prepare_errors"):
+			st.text_area("Prepare errors", st.session_state["data_prepare_errors"], height=160)
+
 	run_pipeline = st.sidebar.button(
 		"Run yelp.py",
 		width="stretch",
-		disabled=bool(missing_inputs),
 	)
 
 	if run_pipeline:

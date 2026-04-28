@@ -1,6 +1,7 @@
 from pathlib import Path
 import subprocess
 import sys
+import shutil
 
 import pandas as pd
 import plotly.express as px
@@ -51,20 +52,36 @@ def sidebar_controls() -> None:
 	if st.sidebar.button("Run yelp.py", width="stretch"):
 		with st.sidebar:
 			with st.spinner("Running yelp.py. This can take several minutes..."):
-				try:
-					result = subprocess.run(
-						[PYTHON_BIN, "-u", "yelp.py"],
-						cwd=PROJECT_ROOT,
-						capture_output=True,
-						text=True,
-					)
-					st.session_state["pipeline_stdout"] = result.stdout
-					st.session_state["pipeline_stderr"] = result.stderr
-					st.session_state["pipeline_code"] = result.returncode
-				except FileNotFoundError as exc:
+				python_exec = Path(PYTHON_BIN)
+				script_path = PROJECT_ROOT / "yelp.py"
+				resolved_python = str(python_exec) if python_exec.exists() else shutil.which("python3")
+
+				if not resolved_python:
 					st.session_state["pipeline_stdout"] = ""
-					st.session_state["pipeline_stderr"] = str(exc)
+					st.session_state["pipeline_stderr"] = (
+						"No Python interpreter found for pipeline execution. "
+						"Expected runtime interpreter or python3 in PATH."
+					)
 					st.session_state["pipeline_code"] = 127
+				elif not script_path.exists():
+					st.session_state["pipeline_stdout"] = ""
+					st.session_state["pipeline_stderr"] = f"Missing pipeline script: {script_path}"
+					st.session_state["pipeline_code"] = 127
+				else:
+					try:
+						result = subprocess.run(
+							[resolved_python, "-u", str(script_path)],
+							cwd=PROJECT_ROOT,
+							capture_output=True,
+							text=True,
+						)
+						st.session_state["pipeline_stdout"] = result.stdout
+						st.session_state["pipeline_stderr"] = result.stderr
+						st.session_state["pipeline_code"] = result.returncode
+					except OSError as exc:
+						st.session_state["pipeline_stdout"] = ""
+						st.session_state["pipeline_stderr"] = str(exc)
+						st.session_state["pipeline_code"] = 127
 				load_csv.clear()
 
 	if "pipeline_code" in st.session_state:

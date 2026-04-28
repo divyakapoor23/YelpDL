@@ -1,8 +1,6 @@
 from pathlib import Path
 import os
 import re
-import subprocess
-import sys
 import shutil
 import tarfile
 import urllib.request
@@ -16,7 +14,6 @@ from PIL import Image, ImageStat
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
-PYTHON_BIN = sys.executable
 
 DEMO_SCENARIOS = {
 	"Custom input": {
@@ -758,20 +755,6 @@ def missing_pipeline_inputs() -> list[Path]:
 	return [path for path in REQUIRED_PIPELINE_INPUTS if not path.exists()]
 
 
-def build_pipeline_env() -> dict[str, str]:
-	env = os.environ.copy()
-	for key in DATA_PATH_ENV_VARS + DATA_URL_ENV_VARS:
-		if key in env and env[key]:
-			continue
-		try:
-			secret_value = st.secrets.get(key)
-		except Exception:
-			secret_value = None
-		if secret_value:
-			env[key] = str(secret_value)
-	return env
-
-
 def sidebar_controls() -> None:
 	st.sidebar.title("Controls")
 	st.sidebar.caption("Run the training/analysis pipeline or inspect saved outputs.")
@@ -811,76 +794,6 @@ def sidebar_controls() -> None:
 			st.text_area("Prepare logs", st.session_state["data_prepare_logs"], height=180)
 		if st.session_state.get("data_prepare_errors"):
 			st.text_area("Prepare errors", st.session_state["data_prepare_errors"], height=160)
-
-	run_pipeline = st.sidebar.button(
-		"Run yelp.py",
-		width="stretch",
-	)
-
-	if run_pipeline:
-		with st.sidebar:
-			with st.spinner("Running yelp.py. This can take several minutes..."):
-				pipeline_env = build_pipeline_env()
-				if missing_inputs:
-					st.session_state["pipeline_stdout"] = ""
-					st.session_state["pipeline_stderr"] = (
-						"Pipeline inputs are missing. Please add these paths:\n"
-						+ "\n".join(str(path) for path in missing_inputs)
-						+ "\n\nSet one or more of: "
-						+ ", ".join(DATA_PATH_ENV_VARS)
-					)
-					st.session_state["pipeline_code"] = 127
-					load_csv.clear()
-					return
-
-				python_exec = Path(PYTHON_BIN)
-				script_path = PROJECT_ROOT / "yelp.py"
-				resolved_python = str(python_exec) if python_exec.exists() else shutil.which("python3")
-
-				if not resolved_python:
-					st.session_state["pipeline_stdout"] = ""
-					st.session_state["pipeline_stderr"] = (
-						"No Python interpreter found for pipeline execution. "
-						"Expected runtime interpreter or python3 in PATH."
-					)
-					st.session_state["pipeline_code"] = 127
-				elif not script_path.exists():
-					st.session_state["pipeline_stdout"] = ""
-					st.session_state["pipeline_stderr"] = f"Missing pipeline script: {script_path}"
-					st.session_state["pipeline_code"] = 127
-				else:
-					try:
-						result = subprocess.run(
-							[resolved_python, "-u", str(script_path)],
-							cwd=PROJECT_ROOT,
-							capture_output=True,
-							text=True,
-							env=pipeline_env,
-						)
-						st.session_state["pipeline_stdout"] = result.stdout
-						st.session_state["pipeline_stderr"] = result.stderr
-						st.session_state["pipeline_code"] = result.returncode
-					except OSError as exc:
-						st.session_state["pipeline_stdout"] = ""
-						st.session_state["pipeline_stderr"] = str(exc)
-						st.session_state["pipeline_code"] = 127
-				load_csv.clear()
-
-	if "pipeline_code" in st.session_state:
-		code = st.session_state["pipeline_code"]
-		if code == 0:
-			st.sidebar.success("Last run completed successfully.")
-		else:
-			st.sidebar.error(f"Last run failed with exit code {code}.")
-
-		with st.sidebar.expander("Last run logs"):
-			stdout = st.session_state.get("pipeline_stdout", "")
-			stderr = st.session_state.get("pipeline_stderr", "")
-			if stdout:
-				st.text_area("stdout", stdout[-12000:], height=260)
-			if stderr:
-				st.text_area("stderr", stderr[-12000:], height=180)
-
 
 def render_overview() -> None:
 	st.header("Overview")

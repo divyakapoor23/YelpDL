@@ -55,125 +55,6 @@ NEGATIVE_TERMS = {
 	"late", "mediocre", "negative", "overpriced", "salty", "slow", "soggy", "terrible", "underseasoned", "worst",
 }
 
-APP_CSS = """
-<style>
-div.block-container {
-	padding-top: 1.6rem;
-	padding-bottom: 3rem;
-	max-width: 1320px;
-}
-
-.stApp {
-	background:
-		radial-gradient(circle at top right, rgba(205, 120, 63, 0.16), transparent 26%),
-		radial-gradient(circle at top left, rgba(47, 91, 70, 0.12), transparent 22%),
-		linear-gradient(180deg, #fffaf5 0%, #f7efe5 48%, #f3eee9 100%);
-}
-
-div[data-testid="stMetric"] {
-	background: rgba(255, 252, 247, 0.82);
-	border: 1px solid rgba(130, 98, 70, 0.16);
-	border-radius: 20px;
-	padding: 1rem 1.1rem;
-	box-shadow: 0 16px 40px rgba(76, 55, 35, 0.08);
-}
-
-div[data-testid="stMetricLabel"] {
-	font-size: 0.92rem;
-	letter-spacing: 0.02em;
-}
-
-.stButton > button, div[data-testid="stFormSubmitButton"] button {
-	background: linear-gradient(135deg, #a34a1a 0%, #d06f3b 100%);
-	color: white;
-	border: none;
-	border-radius: 999px;
-	padding: 0.7rem 1.2rem;
-	font-weight: 600;
-	box-shadow: 0 12px 30px rgba(163, 74, 26, 0.22);
-}
-
-.stButton > button:hover, div[data-testid="stFormSubmitButton"] button:hover {
-	background: linear-gradient(135deg, #8b3810 0%, #be5d27 100%);
-}
-
-div[data-baseweb="select"] > div,
-div[data-baseweb="base-input"] > div,
-textarea {
-	border-radius: 16px !important;
-	background: rgba(255, 253, 250, 0.88) !important;
-	border-color: rgba(130, 98, 70, 0.18) !important;
-}
-
-.yfi-hero {
-	background: linear-gradient(135deg, rgba(46, 88, 69, 0.96) 0%, rgba(148, 67, 27, 0.96) 100%);
-	border-radius: 28px;
-	padding: 2rem 2.2rem;
-	color: #fff8f2;
-	box-shadow: 0 24px 60px rgba(53, 34, 20, 0.18);
-	margin-bottom: 1rem;
-}
-
-.yfi-hero h1 {
-	margin: 0;
-	font-size: 2.35rem;
-	line-height: 1.05;
-}
-
-.yfi-hero p {
-	margin: 0.85rem 0 0 0;
-	font-size: 1rem;
-	max-width: 760px;
-	line-height: 1.55;
-}
-
-.yfi-badge-row {
-	display: flex;
-	gap: 0.6rem;
-	flex-wrap: wrap;
-	margin-top: 1rem;
-}
-
-.yfi-badge {
-	padding: 0.4rem 0.8rem;
-	border-radius: 999px;
-	background: rgba(255, 248, 242, 0.14);
-	border: 1px solid rgba(255, 248, 242, 0.24);
-	font-size: 0.9rem;
-}
-
-.yfi-panel {
-	background: rgba(255, 252, 247, 0.82);
-	border: 1px solid rgba(130, 98, 70, 0.14);
-	border-radius: 24px;
-	padding: 1.2rem 1.25rem;
-	box-shadow: 0 16px 40px rgba(76, 55, 35, 0.06);
-	height: 100%;
-}
-
-.yfi-panel h3 {
-	margin-top: 0;
-	margin-bottom: 0.45rem;
-	font-size: 1.05rem;
-}
-
-.yfi-panel p {
-	margin-bottom: 0;
-	line-height: 1.5;
-	font-size: 0.95rem;
-}
-
-.yfi-section-label {
-	text-transform: uppercase;
-	letter-spacing: 0.08em;
-	font-size: 0.8rem;
-	color: #91552b;
-	font-weight: 700;
-	margin-bottom: 0.35rem;
-}
-</style>
-"""
-
 
 def _resolve_env_path(name: str, default: Path) -> Path:
 	raw_value = os.getenv(name)
@@ -346,7 +227,7 @@ RESEARCH_QUESTION = (
 
 
 st.set_page_config(
-	page_title="Yelp Food Intelligence App",
+	page_title="Yelp Multimodal Dashboard",
 	page_icon="🍽️",
 	layout="wide",
 )
@@ -369,100 +250,6 @@ def render_table_or_message(df: pd.DataFrame | None, message: str) -> bool:
 		return False
 	st.dataframe(df, width="stretch")
 	return True
-
-
-def apply_app_theme() -> None:
-	st.markdown(APP_CSS, unsafe_allow_html=True)
-
-
-def render_landing_page() -> None:
-	reference_data = _get_demo_reference_data()
-	ablation_df = load_csv(OUTPUT_DIR / "ablation_results.csv")
-	mismatch_df = reference_data.get("mismatch")
-	region_gap_df = reference_data.get("region_gap")
-
-	best_model = "Checkpoint not available"
-	best_f1 = None
-	if ablation_df is not None and not ablation_df.empty and {"Model", "F1"}.issubset(ablation_df.columns):
-		ablation = _coerce_numeric_columns(ablation_df, ["F1", "Accuracy"])
-		best_row = ablation.sort_values("F1", ascending=False).iloc[0]
-		best_model = str(best_row["Model"])
-		best_f1 = float(best_row["F1"])
-
-	top_region_text = "Regional hotspot unavailable"
-	if region_gap_df is not None and not region_gap_df.empty and {"region", "mismatch_rate"}.issubset(region_gap_df.columns):
-		gap_df = _coerce_numeric_columns(region_gap_df, ["mismatch_rate", "samples"])
-		top_region = gap_df.sort_values("mismatch_rate", ascending=False).iloc[0]
-		top_region_text = f"{top_region['region']} gap {float(top_region['mismatch_rate']):.1%}"
-
-	perception_gap = None
-	if mismatch_df is not None and not mismatch_df.empty and "mismatch" in mismatch_df.columns:
-		perception_gap = float(pd.to_numeric(mismatch_df["mismatch"], errors="coerce").mean())
-
-	st.markdown(
-		f"""
-		<div class=\"yfi-hero\">
-			<div class=\"yfi-section-label\">Presentation-ready demo</div>
-			<h1>Yelp Food Intelligence</h1>
-			<p>
-				A real-world multimodal sentiment workflow for restaurants, delivery platforms, and growth teams.
-				Upload a food image, pair it with a Yelp review and market, then explain the prediction with region-aware model evidence.
-			</p>
-			<div class=\"yfi-badge-row\">
-				<div class=\"yfi-badge\">Live checkpoint inference</div>
-				<div class=\"yfi-badge\">Attention-based explanation</div>
-				<div class=\"yfi-badge\">Market and cuisine context</div>
-			</div>
-		</div>
-		""",
-		unsafe_allow_html=True,
-	)
-
-	col1, col2, col3 = st.columns(3)
-	with col1:
-		st.markdown(
-			"""
-			<div class=\"yfi-panel\">
-				<h3>Live prediction flow</h3>
-				<p>Step through the presentation story with image upload, review text, region, cuisine, and a real model prediction.</p>
-			</div>
-			""",
-			unsafe_allow_html=True,
-		)
-	with col2:
-		st.markdown(
-			"""
-			<div class=\"yfi-panel\">
-				<h3>Transparent explanation</h3>
-				<p>Show whether the decision leaned more on visual evidence or textual evidence instead of treating the system like a black box.</p>
-			</div>
-			""",
-			unsafe_allow_html=True,
-		)
-	with col3:
-		st.markdown(
-			"""
-			<div class=\"yfi-panel\">
-				<h3>Business impact</h3>
-				<p>Convert the prediction into actions for operators, recommendation teams, and regional marketing strategy.</p>
-			</div>
-			""",
-			unsafe_allow_html=True,
-		)
-
-	metric1, metric2, metric3 = st.columns(3)
-	with metric1:
-		st.metric("Best checkpoint", best_model, delta=f"F1 {best_f1:.4f}" if best_f1 is not None else None)
-	with metric2:
-		st.metric("Perception gap", f"{perception_gap:.1%}" if perception_gap is not None else "N/A")
-	with metric3:
-		st.metric("Top mismatch market", top_region_text)
-
-	st.markdown("### Demo flow")
-	st.markdown("1. Show the input: food image, Yelp review text, region, and cuisine.")
-	st.markdown("2. Run the checkpointed multimodal model and display sentiment plus confidence.")
-	st.markdown("3. Explain whether the model relied more on image or text attention.")
-	st.markdown("4. Translate the result into a restaurant, delivery, or marketing action.")
 
 
 def _coerce_numeric_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
@@ -521,96 +308,6 @@ def _load_sample_demo_image(reference_data: dict[str, pd.DataFrame | None]) -> s
 	return str(image_path) if image_path.exists() else None
 
 
-@st.cache_resource(show_spinner=False)
-def _load_checkpoint_inference_bundle() -> dict[str, object]:
-	try:
-		import torch
-		import yelp as yelp_module
-		from torchvision import transforms
-	except Exception as exc:
-		return {"error": f"Unable to import the model runtime: {exc}"}
-
-	checkpoint_path = OUTPUT_DIR / "best_Image_plus_Text_plus_Region.pt"
-	if not checkpoint_path.exists():
-		return {"error": f"Missing checkpoint: {checkpoint_path}"}
-
-	try:
-		business_df, review_df, photo_df = yelp_module.load_yelp_data(
-			yelp_module.BUSINESS_PATH,
-			yelp_module.REVIEW_PATH,
-			yelp_module.PHOTO_META_PATH,
-			max_reviews=yelp_module.MAX_REVIEWS,
-			max_photos=yelp_module.MAX_PHOTOS,
-		)
-		df = yelp_module.prepare_multimodal_dataframe(
-			business_df=business_df,
-			review_df=review_df,
-			photo_df=photo_df,
-			photo_dir=yelp_module.PHOTO_DIR,
-		)
-		df = df.sample(min(len(df), 30000), random_state=yelp_module.SEED).reset_index(drop=True)
-		train_df, _ = yelp_module.train_test_split(
-			df,
-			test_size=0.2,
-			random_state=yelp_module.SEED,
-			stratify=df["sentiment"],
-		)
-		train_df = train_df.copy()
-		train_df["primary_category"] = train_df["categories"].apply(yelp_module.extract_primary_category)
-
-		tokenizer = yelp_module.fit_tokenizer(train_df["review_text"].tolist(), vocab_size=yelp_module.VOCAB_SIZE)
-		region_to_id = {region: idx for idx, region in enumerate(sorted(train_df["region"].unique()))}
-		unknown_region_id = len(region_to_id)
-		top_categories = train_df["primary_category"].value_counts().head(yelp_module.MAX_CATEGORY_CLASSES).index.tolist()
-		category_to_id = {cat: idx for idx, cat in enumerate(top_categories)}
-		unknown_category_id = len(category_to_id)
-		category_to_id["<unknown_category>"] = unknown_category_id
-		id_to_category = {idx: cat for cat, idx in category_to_id.items()}
-
-		image_transform = transforms.Compose([
-			transforms.Resize((yelp_module.IMAGE_SIZE, yelp_module.IMAGE_SIZE)),
-			transforms.ToTensor(),
-			transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-		])
-
-		device = torch.device("cpu")
-		model = yelp_module.MultimodalFusionModel(
-			yelp_module.VOCAB_SIZE,
-			unknown_region_id + 1,
-			len(category_to_id),
-			use_pretrained=False,
-		)
-		state_dict = torch.load(checkpoint_path, map_location=device)
-		model.load_state_dict(state_dict)
-		model = model.to(device)
-		model.eval()
-	except Exception as exc:
-		return {"error": f"Unable to prepare checkpoint inference: {exc}"}
-
-	return {
-		"torch": torch,
-		"yelp_module": yelp_module,
-		"device": device,
-		"model": model,
-		"tokenizer": tokenizer,
-		"image_transform": image_transform,
-		"region_to_id": region_to_id,
-		"unknown_region_id": unknown_region_id,
-		"category_to_id": category_to_id,
-		"unknown_category_id": unknown_category_id,
-		"id_to_category": id_to_category,
-	}
-
-
-def _resolve_demo_image(uploaded_image, sample_image_path: str | None, use_sample_image: bool) -> tuple[Image.Image | None, str | None]:
-	if uploaded_image is not None:
-		uploaded_image.seek(0)
-		return Image.open(uploaded_image).convert("RGB"), "Uploaded image"
-	if use_sample_image and sample_image_path:
-		return Image.open(sample_image_path).convert("RGB"), "Sample dataset image"
-	return None, None
-
-
 def _analyze_text_signal(review_text: str) -> dict[str, object]:
 	tokens = re.findall(r"[a-z']+", review_text.lower())
 	positive_hits = [token for token in tokens if token in POSITIVE_TERMS]
@@ -643,28 +340,6 @@ def _analyze_image_signal(uploaded_image) -> dict[str, object]:
 	uploaded_image.seek(0)
 	image = Image.open(uploaded_image).convert("RGB")
 	uploaded_image.seek(0)
-	gray = image.convert("L")
-	rgb_stats = ImageStat.Stat(image)
-	gray_stats = ImageStat.Stat(gray)
-	r_mean, g_mean, b_mean = [channel / 255.0 for channel in rgb_stats.mean[:3]]
-	brightness = gray_stats.mean[0] / 255.0
-	contrast = _clip(gray_stats.stddev[0] / 90.0)
-	warmth = _clip(0.5 + ((r_mean - b_mean) / 2.0))
-	colorfulness = _clip((abs(r_mean - g_mean) + abs(r_mean - b_mean) + abs(g_mean - b_mean)) / 1.5)
-	balanced_brightness = _clip(1.0 - abs(brightness - 0.62) / 0.62)
-	visual_score = _clip(0.35 * balanced_brightness + 0.25 * contrast + 0.20 * warmth + 0.20 * colorfulness)
-	return {
-		"score": visual_score,
-		"summary": f"Visual score combines brightness ({brightness:.0%}), contrast ({contrast:.0%}), and warmth ({warmth:.0%}).",
-		"brightness": brightness,
-		"contrast": contrast,
-		"warmth": warmth,
-	}
-
-
-def _analyze_pil_image_signal(image: Image.Image | None) -> dict[str, object]:
-	if image is None:
-		return _analyze_image_signal(None)
 	gray = image.convert("L")
 	rgb_stats = ImageStat.Stat(image)
 	gray_stats = ImageStat.Stat(gray)
@@ -724,80 +399,45 @@ def _lookup_cuisine_metrics(reference_data: dict[str, pd.DataFrame | None], cuis
 	}
 
 
-def _estimate_demo_prediction(
-	review_text: str,
-	uploaded_image,
-	region: str,
-	cuisine: str,
-	reference_data: dict[str, pd.DataFrame | None],
-	sample_image_path: str | None,
-	use_sample_image: bool,
-) -> dict[str, object]:
-	bundle = _load_checkpoint_inference_bundle()
-	if "error" in bundle:
-		raise RuntimeError(str(bundle["error"]))
-
-	torch = bundle["torch"]
-	yelp_module = bundle["yelp_module"]
-	device = bundle["device"]
-	model = bundle["model"]
-	tokenizer = bundle["tokenizer"]
-	image_transform = bundle["image_transform"]
-	region_to_id = bundle["region_to_id"]
-	unknown_region_id = bundle["unknown_region_id"]
-	category_to_id = bundle["category_to_id"]
-	unknown_category_id = bundle["unknown_category_id"]
-	id_to_category = bundle["id_to_category"]
-
-	pil_image, image_source = _resolve_demo_image(uploaded_image, sample_image_path, use_sample_image)
-	if pil_image is None:
-		raise RuntimeError("Please upload a food image or enable the sample dataset image for checkpoint inference.")
-
+def _estimate_demo_prediction(review_text: str, uploaded_image, region: str, cuisine: str, reference_data: dict[str, pd.DataFrame | None]) -> dict[str, object]:
 	text_result = _analyze_text_signal(review_text)
-	image_result = {
-		**_analyze_pil_image_signal(pil_image),
-		"summary": f"Inference image source: {image_source}. {_analyze_pil_image_signal(pil_image)['summary']}",
-	}
+	image_result = _analyze_image_signal(uploaded_image)
 	region_metrics = _lookup_region_metrics(reference_data, region)
 	cuisine_metrics = _lookup_cuisine_metrics(reference_data, cuisine)
+
 	region_score = region_metrics["positive_rate"] if region_metrics["positive_rate"] is not None else 0.72
+	weights = {"text": 0.55, "image": 0.25 if uploaded_image is not None else 0.0, "region": 0.20 if uploaded_image is not None else 0.45}
+	total_weight = sum(weights.values())
+	final_score = (
+		weights["text"] * float(text_result["score"]) +
+		weights["image"] * float(image_result["score"]) +
+		weights["region"] * float(region_score)
+	) / total_weight
+	final_score = _clip(final_score)
 
-	image_tensor = image_transform(pil_image).unsqueeze(0).to(device)
-	text_seq = yelp_module.encode_texts(tokenizer, [review_text], max_len=yelp_module.MAX_TEXT_LEN)
-	text_tensor = torch.tensor(text_seq, dtype=torch.long, device=device)
-	region_tensor = torch.tensor([region_to_id.get(region, unknown_region_id)], dtype=torch.long, device=device)
-	category_tensor = torch.tensor([category_to_id.get(cuisine, unknown_category_id)], dtype=torch.long, device=device)
-
-	with torch.no_grad():
-		sentiment_logits, category_logits, rating_pred, attention_stats = model(
-			image_tensor,
-			text_tensor,
-			region_tensor,
-			category_tensor,
-			return_attention=True,
-		)
-		positive_probability = float(torch.sigmoid(sentiment_logits).item())
-		predicted_category_id = int(torch.argmax(category_logits, dim=1).item())
-		predicted_rating = float(rating_pred.item())
-		image_attention_raw = float(attention_stats["img_concentration"].squeeze().item())
-		text_attention_raw = float(attention_stats["txt_concentration"].squeeze().item())
-
-	final_score = _clip(positive_probability)
-	confidence = _clip(max(final_score, 1.0 - final_score))
-	label = "Positive" if final_score >= 0.5 else "Negative"
-	attention_total = image_attention_raw + text_attention_raw
-	if attention_total <= 0:
+	text_signal = weights["text"] * abs(float(text_result["score"]) - 0.5)
+	image_signal = weights["image"] * abs(float(image_result["score"]) - 0.5)
+	focus_total = text_signal + image_signal
+	if focus_total == 0:
 		text_focus = 0.5
-		image_focus = 0.5
+		image_focus = 0.5 if uploaded_image is not None else 0.0
 	else:
-		text_focus = text_attention_raw / attention_total
-		image_focus = image_attention_raw / attention_total
+		text_focus = text_signal / focus_total
+		image_focus = image_signal / focus_total if uploaded_image is not None else 0.0
+
+	disagreement_penalty = abs(float(text_result["score"]) - float(image_result["score"])) * 0.18
+	region_penalty = (region_metrics["mismatch_rate"] or 0.30) * 0.08
+	cuisine_penalty = (cuisine_metrics["spread"] or 0.25) * 0.05
+	confidence = _clip(0.58 + abs(final_score - 0.5) * 1.15 - disagreement_penalty - region_penalty - cuisine_penalty, 0.52, 0.98)
+	label = "Positive" if final_score >= 0.5 else "Negative"
 
 	if text_focus >= image_focus:
 		attention_explanation = "The review text is carrying more of the decision than the image in this case."
 	else:
 		attention_explanation = "The food image is carrying more of the decision than the text in this case."
-	attention_explanation += f" Raw model attention concentration: text {text_attention_raw:.1%}, image {image_attention_raw:.1%}."
+
+	if uploaded_image is None:
+		attention_explanation += " Because no custom image was uploaded, the demo relies more heavily on text and region priors."
 
 	if label == "Negative" and text_focus >= image_focus:
 		business_insight = "This looks like a service or taste problem rather than a presentation problem. Route it to review-response or operations teams first."
@@ -815,7 +455,6 @@ def _estimate_demo_prediction(
 		region_insight += "."
 	if cuisine_metrics["spread"] is not None:
 		region_insight += f" {cuisine} shows regional sentiment spread of {cuisine_metrics['spread']:.2f} across {int(cuisine_metrics['region_count'] or 0)} regions."
-	region_insight += f" The multitask head predicts a normalized star score of {predicted_rating:.2f} and category alignment closest to {id_to_category.get(predicted_category_id, '<unknown_category>')}."
 
 	return {
 		"label": label,
@@ -831,9 +470,6 @@ def _estimate_demo_prediction(
 		"business_insight": business_insight,
 		"region_metrics": region_metrics,
 		"cuisine_metrics": cuisine_metrics,
-		"predicted_rating": predicted_rating,
-		"predicted_category": id_to_category.get(predicted_category_id, "<unknown_category>"),
-		"image_source": image_source,
 	}
 
 
@@ -866,7 +502,6 @@ def render_live_prediction_demo() -> None:
 
 		with st.form("live_prediction_form"):
 			uploaded_image = st.file_uploader("Food image", type=["png", "jpg", "jpeg"])
-			use_sample_image = st.checkbox("Use sample dataset image when no upload is provided", value=bool(sample_image_path))
 			review_text = st.text_area("Yelp review text", key="demo_review_text", height=150, placeholder="Paste a review here...")
 			region = st.selectbox(
 				"Region / city",
@@ -886,10 +521,10 @@ def render_live_prediction_demo() -> None:
 
 	with step2:
 		st.markdown("### Input preview")
-		if uploaded_image is not None:
-			st.image(uploaded_image, caption="Uploaded food image", width="stretch")
-		elif use_sample_image and sample_image_path:
+		if sample_image_path:
 			st.image(sample_image_path, caption="Sample food image available in the dataset", width="stretch")
+		elif uploaded_image is not None:
+			st.image(uploaded_image, caption="Uploaded food image", width="stretch")
 		else:
 			st.info("Upload a food photo, or use the sample dataset image for the live demo visual.")
 		st.markdown("**Presentation flow**")
@@ -899,12 +534,7 @@ def render_live_prediction_demo() -> None:
 		st.markdown("4. Turn the result into an operational recommendation.")
 
 	if run_demo:
-		with st.spinner("Running checkpoint inference..."):
-			try:
-				result = _estimate_demo_prediction(review_text, uploaded_image, region, cuisine, reference_data, sample_image_path, use_sample_image)
-			except RuntimeError as exc:
-				st.error(str(exc))
-				return
+		result = _estimate_demo_prediction(review_text, uploaded_image, region, cuisine, reference_data)
 		st.divider()
 		st.markdown("### Step 2: Run prediction")
 		st.write("The model combines visual, textual, and regional signals to predict sentiment.")
@@ -917,7 +547,6 @@ def render_live_prediction_demo() -> None:
 			st.metric("Text focus", f"{float(result['text_focus']):.0%}")
 		with m4:
 			st.metric("Image focus", f"{float(result['image_focus']):.0%}")
-		st.caption(f"Inference source: {result['image_source']} | Predicted category proxy: {result['predicted_category']} | Predicted rating proxy: {float(result['predicted_rating']):.2f}")
 
 		probability_df = pd.DataFrame(
 			{
@@ -974,7 +603,7 @@ def render_live_prediction_demo() -> None:
 		with explain_right:
 			st.markdown("**Visual signal**")
 			st.write(result["image_result"]["summary"])
-			if result["image_result"].get("brightness") is not None:
+			if result["image_result"]["brightness"] is not None:
 				st.caption(
 					f"Brightness {float(result['image_result']['brightness']):.0%} | Contrast {float(result['image_result']['contrast']):.0%} | Warmth {float(result['image_result']['warmth']):.0%}"
 				)
@@ -2397,7 +2026,6 @@ def render_research_insights() -> None:
 
 
 def main() -> None:
-	apply_app_theme()
 	sidebar_controls()
 
 	st.title("Yelp Food Intelligence App")
@@ -2405,9 +2033,8 @@ def main() -> None:
 		"Real-world Streamlit demo for multimodal restaurant sentiment: upload a food image, add review text and region, then turn the prediction into a business insight."
 	)
 
-	landing_tab, prediction_tab, use_cases_tab, explainability_tab, overview_tab, insights_tab, region_tab, attention_tab, consistency_tab, retrieval_tab, text_tab, visual_tab, presentation_tab = st.tabs(
+	prediction_tab, use_cases_tab, explainability_tab, overview_tab, insights_tab, region_tab, attention_tab, consistency_tab, retrieval_tab, text_tab, visual_tab, presentation_tab = st.tabs(
 		[
-			"Landing",
 			"Live Prediction",
 			"Use Cases",
 			"Explainability",
@@ -2423,8 +2050,6 @@ def main() -> None:
 		]
 	)
 
-	with landing_tab:
-		render_landing_page()
 	with prediction_tab:
 		render_live_prediction_demo()
 	with use_cases_tab:

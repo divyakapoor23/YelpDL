@@ -376,11 +376,11 @@ class TextOnlyModel(nn.Module):
 
 
 class MultimodalFusionModel(nn.Module):
-    def __init__(self, vocab_size: int, num_regions: int, num_categories: int):
+    def __init__(self, vocab_size: int, num_regions: int, num_categories: int, use_pretrained: bool = True):
         super().__init__()
 
         # Image branch
-        backbone = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        backbone = models.resnet18(weights=models.ResNet18_Weights.DEFAULT if use_pretrained else None)
         img_features = backbone.fc.in_features
         backbone.fc = nn.Identity()
         self.image_backbone = backbone

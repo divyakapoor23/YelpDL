@@ -11,6 +11,16 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 PYTHON_BIN = sys.executable
+JSON_DATA_DIR = PROJECT_ROOT / "Data" / "Yelp JSON" / "yelp_dataset"
+PHOTO_DATA_DIR = PROJECT_ROOT / "Data" / "Yelp Photos" / "yelp_photos"
+
+REQUIRED_PIPELINE_INPUTS = [
+	JSON_DATA_DIR / "yelp_academic_dataset_business.json",
+	JSON_DATA_DIR / "yelp_academic_dataset_review.json",
+	PHOTO_DATA_DIR / "photos.json",
+	PHOTO_DATA_DIR / "photos",
+]
+
 RESEARCH_QUESTION = (
 	"How do visual, textual, and regional signals interact to shape perceived food sentiment, "
 	"and does incorporating geographic context improve multimodal sentiment prediction?"
@@ -43,15 +53,42 @@ def render_table_or_message(df: pd.DataFrame | None, message: str) -> bool:
 	return True
 
 
+def missing_pipeline_inputs() -> list[Path]:
+	return [path for path in REQUIRED_PIPELINE_INPUTS if not path.exists()]
+
+
 def sidebar_controls() -> None:
 	st.sidebar.title("Controls")
 	st.sidebar.caption("Run the training/analysis pipeline or inspect saved outputs.")
 	st.sidebar.markdown("**Research Question**")
 	st.sidebar.write(RESEARCH_QUESTION)
 
-	if st.sidebar.button("Run yelp.py", width="stretch"):
+	missing_inputs = missing_pipeline_inputs()
+	if missing_inputs:
+		st.sidebar.warning(
+			"Pipeline inputs are missing in this environment. "
+			"You can still explore the precomputed outputs below."
+		)
+
+	run_pipeline = st.sidebar.button(
+		"Run yelp.py",
+		width="stretch",
+		disabled=bool(missing_inputs),
+	)
+
+	if run_pipeline:
 		with st.sidebar:
 			with st.spinner("Running yelp.py. This can take several minutes..."):
+				if missing_inputs:
+					st.session_state["pipeline_stdout"] = ""
+					st.session_state["pipeline_stderr"] = (
+						"Pipeline inputs are missing. Please add these paths:\n"
+						+ "\n".join(str(path) for path in missing_inputs)
+					)
+					st.session_state["pipeline_code"] = 127
+					load_csv.clear()
+					return
+
 				python_exec = Path(PYTHON_BIN)
 				script_path = PROJECT_ROOT / "yelp.py"
 				resolved_python = str(python_exec) if python_exec.exists() else shutil.which("python3")
